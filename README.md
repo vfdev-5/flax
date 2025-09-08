@@ -1,3 +1,5 @@
+Update for v0.11.4
+
 <div align="center">
 <img src="https://raw.githubusercontent.com/google/flax/main/images/flax_logo_250px.png" alt="logo"></img>
 </div>
