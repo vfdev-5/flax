@@ -25,7 +25,7 @@ from flax.nnx import (
   graph,
   variablelib,
 )
-from flax.nnx.statelib import EmptyState, State
+from flax.nnx.statelib import State
 import jax
 import jax.core
 import jax.stages
@@ -64,7 +64,7 @@ class DiffState:
 class GradFn:
   f: tp.Callable[..., tp.Any]
   has_aux: bool
-  nondiff_states: deque[State | variablelib.VariableState | None]
+  nondiff_states: deque[State | None]
 
   def __post_init__(self):
     functools.update_wrapper(self, self.f)
@@ -106,7 +106,6 @@ def _grad_general(
   has_aux: bool,
   holomorphic: bool,
   allow_int: bool,
-  reduce_axes: tp.Sequence[AxisName],
   return_value: bool,
 ) -> tp.Callable[..., tp.Any]:
   transform = jax.value_and_grad if return_value else jax.grad
@@ -135,7 +134,7 @@ def _grad_general(
   def grad_wrapper(*args, **kwargs):
     args = resolve_kwargs(f, args, kwargs)
     del kwargs
-    nondiff_states: deque[State | variablelib.VariableState | None] = deque()
+    nondiff_states: deque[State | variablelib.Variable | None] = deque()
 
     def _grad_split_fn(
       ctx: graph.SplitContext, path, prefix: DiffState | None, value
@@ -159,7 +158,6 @@ def _grad_general(
       has_aux=True,
       holomorphic=holomorphic,
       allow_int=allow_int,
-      reduce_axes=reduce_axes,
     )
 
     fn_out = gradded_fn(*pure_args)
@@ -251,12 +249,10 @@ def grad(
     >>> grads = grad_fn(m, x, y)
     >>> jax.tree.map(jnp.shape, grads)
     State({
-      'bias': VariableState(
-        type=Param,
+      'bias': Param(
         value=(3,)
       ),
-      'kernel': VariableState(
-        type=Param,
+      'kernel': Param(
         value=(2, 3)
       )
     })
@@ -277,8 +273,7 @@ def grad(
     >>> grads = grad_fn(m, x, y)
     >>> jax.tree.map(jnp.shape, grads)
     State({
-      'kernel': VariableState(
-        type=Param,
+      'kernel': Param(
         value=(2, 3)
       )
     })
@@ -304,14 +299,10 @@ def grad(
     allow_int: Optional, bool. Whether to allow differentiating with
       respect to integer valued inputs. The gradient of an integer input will
       have a trivial vector-space dtype (float0). Default False.
-    reduce_axes: Optional, tuple of axis names. If an axis is listed here, and
-      ``fun`` implicitly broadcasts a value over that axis, the backward pass
-      will perform a ``psum`` of the corresponding gradient. Otherwise, the
-      gradient will be per-example over named axes. For example, if ``'batch'``
-      is a named batch axis, ``grad(f, reduce_axes=('batch',))`` will create a
-      function that computes the total gradient while ``grad(f)`` will create
-      one that computes the per-example gradient.
   """
+  if reduce_axes:
+    raise NotImplementedError('reduce_axes argument to grad is deprecated')
+  del reduce_axes
 
   if isinstance(f, Missing):
     return functools.partial(
@@ -320,7 +311,6 @@ def grad(
       has_aux=has_aux,
       holomorphic=holomorphic,
       allow_int=allow_int,
-      reduce_axes=reduce_axes,
     )
   return _grad_general(
     f,
@@ -328,7 +318,6 @@ def grad(
     has_aux,
     holomorphic,
     allow_int,
-    reduce_axes,
     return_value=False,
   )
 
@@ -364,6 +353,11 @@ def value_and_grad(
   tp.Callable[..., tp.Any]
   | tp.Callable[[tp.Callable[..., tp.Any]], tp.Callable[..., tp.Any]]
 ):
+  if reduce_axes:
+    raise NotImplementedError(
+        'reduce_axes argument to value_and_grad is deprecated')
+  del reduce_axes
+
   if f is Missing:
     return functools.partial(
       value_and_grad,
@@ -371,7 +365,6 @@ def value_and_grad(
       has_aux=has_aux,
       holomorphic=holomorphic,
       allow_int=allow_int,
-      reduce_axes=reduce_axes,
     )
   return _grad_general(
     f,
@@ -379,7 +372,6 @@ def value_and_grad(
     has_aux,
     holomorphic,
     allow_int,
-    reduce_axes,
     return_value=True,
   )
 
@@ -432,7 +424,7 @@ def _custom_vjp_split_fn(
     # but we return a TreeNode.from_states which doesn't have a graphdef
     # in order to keep the gradients clean from any metadata
     graphdef, passed = ctx.split(value)
-    broadcast = EmptyState()
+    broadcast = State({})
     nondiff_states.append(extract.GraphDefState(graphdef, broadcast))
     return extract.NodeStates.from_states(passed)
   else:
@@ -448,9 +440,8 @@ def _custom_vjp_split_fn(
   nondiff_argnums: tuple[int, ...] = struct.field(pytree_node=False)
   tangent_tree_node_args: tuple[tp.Any, ...] = struct.field(pytree_node=False)
 
-def _extract_nodedefs(x, *, nodedefs: deque[graph.NodeDef]):
-  if isinstance(x, graph.NodeDef):
-    assert x.outer_index is not None
+def _extract_nodedefs(x, *, nodedefs: deque[graph.GraphDef]):
+  if isinstance(x, graph.GraphDef):
     nodedefs.append(x)
     return x.with_no_outer_index()
   return x
@@ -461,7 +452,7 @@ class CustomVjpFnWrapper:
   jax_nondiff_argnums: tuple[int, ...]
   ctxtag: str
   nondiff_states: list[extract.GraphDefState]
-  nodedefs: deque[graph.NodeDef]
+  nodedefs: deque[graph.GraphDef]
 
   def __post_init__(self):
     functools.update_wrapper(self, self.f)
@@ -487,12 +478,12 @@ class CustomVjpFnWrapper:
     pure_args_out, pure_out = extract.to_tree(
       (args_out, out), ctxtag=self.ctxtag
     )
-    # remove outer_index from NodeDef's but store them in global context
+    # remove outer_index from GraphDef's but store them in global context
 
     pure_args_out, pure_out = jax.tree.map(
       functools.partial(_extract_nodedefs, nodedefs=self.nodedefs),
       (pure_args_out, pure_out),
-      is_leaf=lambda x: isinstance(x, graph.NodeDef),
+      is_leaf=lambda x: isinstance(x, graph.GraphDef),
     )
 
     return pure_args_out, pure_out
@@ -504,7 +495,7 @@ class FwdFn:
   nondiff_argnums: tuple[int, ...]
   ctxtag: str
   nondiff_states: list[extract.GraphDefState]
-  nodedefs: deque[graph.NodeDef]
+  nodedefs: deque[graph.GraphDef]
 
   def __post_init__(self):
     functools.update_wrapper(self, self.fwd)
@@ -512,7 +503,7 @@ class FwdFn:
   def __call__(self, *pure_args):
     # here we need to be aware if the update_context is active or not
     # when its not active, index_mappings will be None
-    # when its active, we will remove the index_mappings from the NodeDef's and store them
+    # when its active, we will remove the index_mappings from the GraphDef's and store them
     # in the index_mappings deque created by CustomVjp
     update_context_active = (
       self.ctxtag in graph.GRAPH_CONTEXT.update_context_stacks
@@ -541,11 +532,11 @@ class FwdFn:
     pure_residual = extract.to_tree(residual)
 
     if update_context_active:
-      # remove outer_index from NodeDef's but store them in global context
+      # remove outer_index from GraphDef's but store them in global context
       pure_args_out, pure_out = jax.tree.map(
         functools.partial(_extract_nodedefs, nodedefs=self.nodedefs),
         (pure_args_out, pure_out),
-        is_leaf=lambda x: isinstance(x, graph.NodeDef),
+        is_leaf=lambda x: isinstance(x, graph.GraphDef),
       )
 
     return (pure_args_out, pure_out), pure_residual
@@ -574,8 +565,8 @@ class BwdFn:
       if is_differentiable:
         if isinstance(x, jax.Array):
           return x
-        elif not isinstance(x, State | variablelib.VariableState):
-          raise ValueError(f'Expected State or VariableState, got {type(x)}')
+        elif not isinstance(x, State | variablelib.Variable):
+          raise ValueError(f'Expected State or Variable, got {type(x)}')
         return extract.NodeStates.from_states(x)
       return x
 
@@ -583,7 +574,7 @@ class BwdFn:
       state_to_node_states,
       self.tree_node_args,
       tangent,
-      is_leaf=lambda x: isinstance(x, State | variablelib.VariableState),
+      is_leaf=lambda x: isinstance(x, State | variablelib.Variable),
     )
     return pure_tangent
 
@@ -649,7 +640,7 @@ class CustomVjp(tp.Generic[A]):
         for i, x in enumerate(tree_node_args)
         if i not in self.jax_nondiff_argnums
       )
-      nodedefs: deque[graph.NodeDef] = deque()
+      nodedefs: deque[graph.GraphDef] = deque()
       if self.fwd is None or self.bwd is None or self.symbolic_zeros is None:
         raise ValueError()
 
@@ -681,15 +672,15 @@ class CustomVjp(tp.Generic[A]):
 
       # insert index_mappings
       def _insert_index_mappings(x):
-        if isinstance(x, graph.NodeDef):
-          nodedef: graph.NodeDef = nodedefs.popleft()
+        if isinstance(x, graph.GraphDef):
+          nodedef = nodedefs.popleft()
           return nodedef
         return x
 
       pure_args_out, pure_out = jax.tree_util.tree_map(
         _insert_index_mappings,
         (pure_args_out, pure_out),
-        is_leaf=lambda x: isinstance(x, graph.NodeDef),
+        is_leaf=lambda x: isinstance(x, graph.GraphDef),
       )
 
       args_out, out = extract.from_tree(
@@ -771,12 +762,10 @@ def custom_vjp(
     ...
     >>> jax.tree.map(jnp.shape, grads)
     State({
-      'x': VariableState(
-        type=Param,
+      'x': Param(
         value=()
       ),
-      'y': VariableState(
-        type=Param,
+      'y': Param(
         value=()
       )
     })
@@ -819,8 +808,7 @@ def custom_vjp(
     ...
     >>> jax.tree.map(jnp.shape, grad)
     State({
-      'x': VariableState(
-        type=Param,
+      'x': Param(
         value=()
       )
     })
@@ -871,6 +859,20 @@ def remat(
   static_argnums: int | tuple[int, ...] = (),
   policy: tp.Callable[..., bool] | None = None,
 ) -> F | tp.Callable[[F], F]:
+  """A 'lifted' version of the
+  `jax.checkpoint <https://jax.readthedocs.io/en/latest/_autosummary/jax.checkpoint.html>`__
+  (a.k.a. ``jax.remat``).
+
+  ``flax.nnx.remat``, similar to ``jax.checkpoint`` can provide control over, for
+    example, how ``flax.nnx.grad`` values are computed and saved during the forward pass versus
+    how they are recomputed during the backward pass, trading off memory and FLOPs.
+
+  Learn more in `Flax NNX vs JAX Transformations <https://flax.readthedocs.io/en/latest/guides/jax_and_nnx_transforms.html>`_.
+
+  To learn about ``jax.remat``, go to JAX's
+    `fundamentals of jax.checkpoint <https://jax.readthedocs.io/en/latest/notebooks/autodiff_remat.html#fundamentals-of-jax-checkpoint>`_
+    and `practical notes <https://jax.readthedocs.io/en/latest/notebooks/autodiff_remat.html#practical-notes>`_.
+  """
   if isinstance(f, Missing):
     return functools.partial(
       remat,
@@ -892,18 +894,3 @@ def remat(
       ),
     )
   )
-  """A 'lifted' version of the
-  `jax.checkpoint <https://jax.readthedocs.io/en/latest/_autosummary/jax.checkpoint.html>`__
-  (a.k.a. ``jax.remat``).
-
-  ``flax.nnx.remat``, similar to ``jax.checkpoint`` can provide control over, for
-    example, how ``flax.nnx.grad`` values are computed and saved during the forward pass versus
-    how they are recomputed during the backward pass, trading off memory and FLOPs.
-
-  Learn more in `Flax NNX vs JAX Transformations <https://flax.readthedocs.io/en/latest/guides/jax_and_nnx_transforms.html>`_.
-
-  To learn about ``jax.remat``, go to JAX's
-    `fundamentals of jax.checkpoint <https://jax.readthedocs.io/en/latest/notebooks/autodiff_remat.html#fundamentals-of-jax-checkpoint>`_
-    and `practical notes <https://jax.readthedocs.io/en/latest/notebooks/autodiff_remat.html#practical-notes>`_.
-  """
-

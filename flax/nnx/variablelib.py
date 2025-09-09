@@ -14,11 +14,14 @@
 # pytype: skip-file
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
 from functools import partial
+import threading
 import typing as tp
 from typing import Any
+from flax import config
 
 import jax
 import treescope  # type: ignore[import-untyped]
@@ -27,6 +30,8 @@ from flax import errors
 from flax.nnx import filterlib, reprlib, tracers, visualization
 from flax.typing import Missing, PathParts, SizeBytes
 import jax.tree_util as jtu
+import jax.numpy as jnp
+from jax._src.state.types import AbstractRef
 
 A = tp.TypeVar('A')
 B = tp.TypeVar('B')
@@ -39,6 +44,108 @@ AxisName = str
 AxisIndex = int
 AddAxisHook = tp.Callable[[V, AxisIndex, AxisName | None], None]
 RemoveAxisHook = tp.Callable[[V, AxisIndex, AxisName | None], None]
+
+if hasattr(jax, 'array_ref') and hasattr(jax, 'ArrayRef'):
+  from jax import array_ref # type: ignore[import-untyped]
+  from jax import ArrayRef  # type: ignore[import-untyped]
+elif not tp.TYPE_CHECKING:
+  from jax._src.core import mutable_array, MutableArray
+  array_ref = mutable_array
+  ArrayRef = MutableArray
+  # temp workaround future proof correct repr
+  MutableArray.__repr__ = lambda self: 'ArrayRef' + repr(self._buf)[5:] # type: ignore[method-assign]
+
+@dataclasses.dataclass
+class VariableContext(threading.local):
+  mutable_variable_stack: list[bool] = dataclasses.field(default_factory=list)
+
+
+VARIABLE_CONTEXT = VariableContext()
+
+
+def using_refs() -> bool:
+  """Returns whether Variables are using ArrayRefs by default.
+
+  Example::
+
+    >>> from flax import nnx
+    ...
+    >>> nnx.using_refs()
+    False
+    >>> nnx.use_refs(True)
+    <...>
+    >>> nnx.using_refs()
+    True
+
+  Returns:
+    A boolean indicating if Variables are using ArrayRefs by default.
+  """
+  if VARIABLE_CONTEXT.mutable_variable_stack:
+    return VARIABLE_CONTEXT.mutable_variable_stack[-1]
+  else:
+    return config.flax_array_ref
+
+
+def use_refs(value: bool, /):
+  """Sets whether Variables should use ArrayRefs by default or not.
+
+  Example usage::
+
+    >>> from flax import nnx
+    >>> # Use ArrayRefs by default
+    >>> nnx.use_refs(True)
+    <...>
+    >>> # Variable will now use ArrayRefs
+    >>> v = nnx.Variable(jax.numpy.ones((2, 3)))
+    >>> v.has_ref
+    True
+    >>> v.raw_value
+    ArrayRef(...)
+
+  It can also be used as a context manager to temporarily
+  change the default behavior for a block of code::
+
+    >>> nnx.use_refs(False)
+    <...>
+    >>> with nnx.use_refs(True):
+    ...   v = nnx.Variable(jax.numpy.ones((2, 3)))
+    ...   v.has_ref
+    True
+    >>> # it will reset outside
+    >>> v = nnx.Variable(jax.numpy.ones((2, 3)))
+    >>> v.has_ref
+    False
+
+  Args:
+    value: A boolean indicating if Variables should use ArrayRefs by default.
+
+  Returns:
+    A context manager that resets the context to the previous value.
+  """
+  # prev_value = VARIABLE_CONTEXT.mutable_variable_stack[-1] if VARIABLE_CONTEXT.mutable_variable_stack else None
+  # VARIABLE_CONTEXT.mutable_variable_stack.append(value)
+  if VARIABLE_CONTEXT.mutable_variable_stack:
+    prev_value = VARIABLE_CONTEXT.mutable_variable_stack[-1]
+    VARIABLE_CONTEXT.mutable_variable_stack[-1] = value
+  else:
+    prev_value = None
+    VARIABLE_CONTEXT.mutable_variable_stack.append(value)
+  return _clean_mutable_arrays_context(prev_value)
+
+@contextlib.contextmanager
+def _clean_mutable_arrays_context(prev_value: bool | None):
+  if prev_value is not None:
+    VARIABLE_CONTEXT.mutable_variable_stack.insert(-1, prev_value)
+  try:
+    yield
+  finally:
+    VARIABLE_CONTEXT.mutable_variable_stack.pop()
+
+
+def is_array_ref(x) -> tp.TypeGuard[ArrayRef]:
+  return isinstance(x, jax.Array | AbstractRef | ArrayRef) and isinstance(
+    jax.typeof(x), AbstractRef | ArrayRef
+  )
 
 
 @dataclasses.dataclass
@@ -78,12 +185,10 @@ class Variable(tp.Generic[A], reprlib.Representable):
     >>> jax.tree.map(jnp.shape, linear_variables)
     State({
       'linear': {
-        'bias': VariableState(
-          type=Param,
+        'bias': Param(
           value=(3,)
         ),
-        'kernel': VariableState(
-          type=Param,
+        'kernel': Param(
           value=(2, 3)
         )
       }
@@ -92,8 +197,7 @@ class Variable(tp.Generic[A], reprlib.Representable):
     >>> custom_variable = nnx.state(model, CustomVariable)
     >>> jax.tree.map(jnp.shape, custom_variable)
     State({
-      'custom_variable': VariableState(
-        type=CustomVariable,
+      'custom_variable': CustomVariable(
         value=(1, 3)
       )
     })
@@ -101,17 +205,14 @@ class Variable(tp.Generic[A], reprlib.Representable):
     >>> variables = nnx.state(model)
     >>> jax.tree.map(jnp.shape, variables)
     State({
-      'custom_variable': VariableState(
-        type=CustomVariable,
+      'custom_variable': CustomVariable(
         value=(1, 3)
       ),
       'linear': {
-        'bias': VariableState(
-          type=Param,
+        'bias': Param(
           value=(3,)
         ),
-        'kernel': VariableState(
-          type=Param,
+        'kernel': Param(
           value=(2, 3)
         )
       }
@@ -127,8 +228,13 @@ class Variable(tp.Generic[A], reprlib.Representable):
   def __init__(
     self,
     value: tp.Union[A, VariableMetadata[A]],
+    *,
+    use_ref: bool | None = None,
     **metadata: tp.Any,
   ):
+    if use_ref is None:
+      use_ref = using_refs()
+
     var_t = type(self)
     object.__setattr__(self, '_trace_state', tracers.TraceState())
 
@@ -136,7 +242,15 @@ class Variable(tp.Generic[A], reprlib.Representable):
       metadata.update(value.metadata)
       value = tp.cast(A, value.raw_value)
 
-    object.__setattr__(self, 'raw_value', value)
+    if use_ref:
+      if is_array_ref(value):
+        _value = tp.cast(A, value)
+      else:
+        _value = array_ref(jnp.asarray(value))  # type: ignore[assignment]  # type: ignore[assignment]
+    else:
+      _value = value
+
+    object.__setattr__(self, 'raw_value', _value)
 
     if hasattr(var_t, 'on_get_value') and 'on_get_value' not in metadata:
       metadata['on_get_value'] = var_t.on_get_value
@@ -153,6 +267,9 @@ class Variable(tp.Generic[A], reprlib.Representable):
     if hasattr(var_t, 'on_remove_axis') and 'on_remove_axis' not in metadata:
       metadata['on_remove_axis'] = var_t.on_remove_axis
 
+    if 'sharding' in metadata:
+      metadata['sharding_names'] = metadata.pop('sharding')
+
     object.__setattr__(self, '_var_metadata', metadata)
     # run create_value hooks
     object.__setattr__(self, 'raw_value', self.create_value(self.raw_value))
@@ -160,14 +277,15 @@ class Variable(tp.Generic[A], reprlib.Representable):
   def __getattr__(self, name: str) -> tp.Any:
     if name in object.__getattribute__(self, '_var_metadata'):
       return self._var_metadata[name]
-    return getattr(self.value, name)
+    return getattr(self.raw_value, name)
 
   def __setattr__(self, name: str, value: tp.Any):
-    if not self._trace_state.is_valid():
+    if not self._trace_state.is_valid() and (
+      name != 'value' or not self.has_ref
+    ):
       raise errors.TraceContextError(
         f'Cannot mutate {type(self).__name__} from a different trace level'
       )
-
     if (
       name == 'value'
       or name == 'raw_value'
@@ -194,9 +312,21 @@ class Variable(tp.Generic[A], reprlib.Representable):
     else:
       del self._var_metadata[name]
 
-  @classmethod
-  def state(cls, value: A, **metadata) -> VariableState[A]:
-    return cls(value, **metadata).to_state()
+  # NOTE(cgarciae): adding this for backward compatibility with VariableState
+  @property
+  def type(self):
+    """The type of the variable."""
+    import warnings
+    warnings.warn(
+      "'.type' is deprecated, use 'type(variable)' instead.",
+      DeprecationWarning,
+      stacklevel=2,
+    )
+    return type(self)
+
+  @property
+  def has_ref(self) -> bool:
+    return is_array_ref(self.raw_value)
 
   def get_metadata(self):
     return self._var_metadata
@@ -213,15 +343,25 @@ class Variable(tp.Generic[A], reprlib.Representable):
     self._var_metadata.clear()
     self._var_metadata.update(other.get_metadata())
 
-  def update_from_state(self, variable_state: VariableState[A]):
-    object.__setattr__(self, 'raw_value', variable_state.value)
-    object.__setattr__(
+  def update_from_state(self, variable_state: Variable[A]):
+    if self.has_ref and (
+      variable_state.has_ref or isinstance(variable_state.raw_value, jax.Array)
+    ):
+      self.raw_value[...] = variable_state.raw_value[...] # type: ignore
+    else:
+      object.__setattr__(self, 'raw_value', variable_state.raw_value)
+
+    if self._var_metadata != variable_state._var_metadata:
+      object.__setattr__(
         self, '_var_metadata', variable_state._var_metadata.copy()
-    )
+      )
 
   @property
   def value(self) -> A:
     value = self.raw_value
+    if is_array_ref(value):
+      value = value[...]
+
     if 'on_get_value' in self._var_metadata:
       value = self._var_metadata['on_get_value'](self, value)
     return value
@@ -230,11 +370,14 @@ class Variable(tp.Generic[A], reprlib.Representable):
   def value(self, value: A):
     if isinstance(value, Variable):
       raise ValueError(
-        'Cannot set value to a Variable, ' 'use `copy_from` method instead'
+        'Cannot set value to a Variable, use `copy_from` method instead'
       )
     if 'on_set_value' in self._var_metadata:
       value = self._var_metadata['on_set_value'](self, value)
-    object.__setattr__(self, 'raw_value', value)
+    if self.has_ref:
+      self.raw_value[...] = value  # type: ignore
+    else:
+      object.__setattr__(self, 'raw_value', value)
 
   def create_value(self, value: A):
     if 'on_create_value' in self._var_metadata:
@@ -288,8 +431,7 @@ class Variable(tp.Generic[A], reprlib.Representable):
     obj = object.__new__(type(self))
     object.__setattr__(obj, '_trace_state', self._trace_state)
     object.__setattr__(obj, 'raw_value', kwargs.pop('raw_value'))
-    object.__setattr__(obj, '_var_metadata', self.get_metadata())
-    obj._var_metadata.update(kwargs)
+    object.__setattr__(obj, '_var_metadata', self.get_metadata() | kwargs)
     return obj
 
   @classmethod
@@ -302,16 +444,15 @@ class Variable(tp.Generic[A], reprlib.Representable):
 
   def copy(self: Variable[A]) -> Variable[A]:
     obj = object.__new__(type(self))
-    object.__setattr__(obj, '_trace_state', self._trace_state)
+    object.__setattr__(obj, '_trace_state', tracers.TraceState())
     object.__setattr__(obj, 'raw_value', self.raw_value)
     object.__setattr__(obj, '_var_metadata', self.get_metadata().copy())
     return obj
 
-  def to_state(self: Variable[A]) -> VariableState[A]:
-    return VariableState(type(self), self.raw_value, **self._var_metadata)
+  to_state = copy
 
   def __nnx_repr__(self):
-    stats = SizeBytes.from_any(self.value)
+    stats = SizeBytes.from_any(self.raw_value)
     if stats:
       comment = f' # {stats}'
     else:
@@ -320,7 +461,7 @@ class Variable(tp.Generic[A], reprlib.Representable):
     yield reprlib.Object(type=type(self).__name__, comment=comment)
     yield reprlib.Attr('value', self.raw_value)
     for name, value in self._var_metadata.items():
-      yield reprlib.Attr(name, repr(value))
+      yield reprlib.Attr(name, value)
 
   def __treescope_repr__(self, path, subtree_renderer):
     size_bytes = SizeBytes.from_any(self.value)
@@ -364,9 +505,9 @@ class Variable(tp.Generic[A], reprlib.Representable):
   # pickle support
   def __getstate__(self):
     return {
-        'raw_value': self.raw_value,
-        '_trace_state': self._trace_state,
-        '_var_metadata': self._var_metadata,
+      'raw_value': self.raw_value,
+      '_trace_state': self._trace_state,
+      '_var_metadata': self._var_metadata,
     }
 
   def __setstate__(self, state):
@@ -378,11 +519,22 @@ class Variable(tp.Generic[A], reprlib.Representable):
   # proxy methods
   # --------------------------------------------
 
-  def __getitem__(self, key) -> tp.Any:
+  def __getitem__(self, key) -> jax.Array:
     return self.value[key]  # type: ignore
 
   def __setitem__(self, key, value) -> None:
-    self.value[key] = value  # type: ignore
+    if not self.has_ref and not self._trace_state.is_valid():
+      raise errors.TraceContextError(
+        f'Cannot mutate {type(self).__name__} from a different trace level'
+      )
+    if self.has_ref:
+      self.raw_value[key] = value  # type: ignore
+    elif key == ...:
+      self.value = value
+    elif isinstance(self.raw_value, jax.Array):
+      self.raw_value = self.raw_value.at[key].set(value)  # type: ignore
+    else:
+      self.raw_value[key] = value  # type: ignore
 
   def __call__(self, *args, **kwargs) -> tp.Any:
     return self.value(*args, **kwargs)  # type: ignore
@@ -702,6 +854,47 @@ class Variable(tp.Generic[A], reprlib.Representable):
   def __ceil__(self) -> A:
     return self.value.__ceil__()  # type: ignore
 
+  # --------------------------------------------
+
+  def __init_subclass__(cls) -> None:
+    super().__init_subclass__()
+
+    jax.tree_util.register_pytree_with_keys(
+      cls,
+      flatten_with_keys=_variable_flatten_with_keys,
+      unflatten_func=partial(_variable_unflatten, cls),  # type: ignore
+      flatten_func=_variable_flatten,
+    )
+
+
+def _variable_flatten_with_keys(x: Variable[tp.Any]):
+  metadata = tuple(x.get_metadata().items())
+  node = (jtu.GetAttrKey('value'), x.raw_value)
+  return (node,), metadata
+
+
+def _variable_flatten(x: Variable[tp.Any]):
+  metadata = tuple(x.get_metadata().items())
+  return (x.raw_value,), metadata
+
+
+def _variable_unflatten(
+  cls: type[Variable[tp.Any]],
+  static: tuple[tuple[str, tp.Any], ...],
+  children: tuple[tp.Any],
+):
+  return cls.from_metadata(value=children[0], attributes=dict(static))
+
+
+jax.tree_util.register_pytree_with_keys(
+  Variable,
+  flatten_with_keys=_variable_flatten_with_keys,
+  unflatten_func=partial(_variable_unflatten, Variable),  # type: ignore
+  flatten_func=_variable_flatten,
+)
+
+
+VariableState = Variable
 
 class Param(Variable[A]):
   """The canonical learnable parameter. All learnable parameters
@@ -714,12 +907,10 @@ class Param(Variable[A]):
     >>> layer = nnx.Linear(2, 3, rngs=nnx.Rngs(0))
     >>> jax.tree.map(jnp.shape, nnx.state(layer))
     State({
-      'bias': VariableState(
-        type=Param,
+      'bias': Param(
         value=(3,)
       ),
-      'kernel': VariableState(
-        type=Param,
+      'kernel': Param(
         value=(2, 3)
       )
     })
@@ -741,20 +932,16 @@ class BatchStat(Variable[A]):
     >>> layer = nnx.BatchNorm(3, rngs=nnx.Rngs(0))
     >>> jax.tree.map(jnp.shape, nnx.state(layer))
     State({
-      'bias': VariableState(
-        type=Param,
+      'bias': Param(
         value=(3,)
       ),
-      'mean': VariableState(
-        type=BatchStat,
+      'mean': BatchStat(
         value=(3,)
       ),
-      'scale': VariableState(
-        type=Param,
+      'scale': Param(
         value=(3,)
       ),
-      'var': VariableState(
-        type=BatchStat,
+      'var': BatchStat(
         value=(3,)
       )
     })
@@ -781,16 +968,13 @@ class Cache(Variable[A]):
   >>> layer.init_cache((1, 3))
   >>> jax.tree.map(jnp.shape, nnx.state(layer, nnx.Cache))
   State({
-    'cache_index': VariableState(
-      type=Cache,
+    'cache_index': Cache(
       value=()
     ),
-    'cached_key': VariableState(
-      type=Cache,
+    'cached_key': Cache(
       value=(1, 2, 3)
     ),
-    'cached_value': VariableState(
-      type=Cache,
+    'cached_value': Cache(
       value=(1, 2, 3)
     )
   })
@@ -821,8 +1005,7 @@ class Intermediate(Variable[A]):
     >>> y = model(x)
     >>> jax.tree.map(jnp.shape, nnx.state(model, nnx.Intermediate))
     State({
-      'i': VariableState(
-        type=Intermediate,
+      'i': Intermediate(
         value=((1, 3),)
       )
     })
@@ -853,137 +1036,13 @@ class Perturbation(Intermediate[A]):
     >>> y = model(x)
     >>> jax.tree.map(jnp.shape, nnx.state(model, nnx.Perturbation))
     State({
-      'i': VariableState(
-        type=Perturbation,
+      'i': Perturbation(
         value=(1, 3)
       )
     })
   """
 
   pass
-
-
-class VariableState(tp.Generic[A], reprlib.Representable):
-  __slots__ = ('type', 'value', '_var_metadata')
-  type: type[Variable[A]]
-  value: A
-  _var_metadata: dict[str, tp.Any]
-
-  def __init__(
-    self,
-    type: type[Variable[A]],  # type: ignore [valid-type]
-    value: A,
-    **metadata,
-  ):
-    object.__setattr__(self, 'type', type)
-    object.__setattr__(self, 'value', value)
-    object.__setattr__(self, '_var_metadata', metadata)
-
-  def __getattr__(self, name: str) -> None:
-    var_metadata = object.__getattribute__(self, '_var_metadata')
-    if name not in var_metadata:
-      raise AttributeError(f"'VariableState' object has no attribute '{name}'")
-    return var_metadata[name]
-
-  def __setattr__(self, name: str, value: Any) -> None:
-    if name == 'type' or name == 'value' or name == '_var_metadata':
-      object.__setattr__(self, name, value)
-    else:
-      self._var_metadata[name] = value
-
-  def __delattr__(self, name: str) -> None:
-    if name == 'type' or name == 'value' or name == '_var_metadata':
-      object.__delattr__(self, name)
-    else:
-      del self._var_metadata[name]
-
-  def __nnx_repr__(self):
-    stats = SizeBytes.from_any(self.value)
-    if stats:
-      comment = f' # {stats}'
-    else:
-      comment = ''
-
-    yield reprlib.Object(type=type(self), comment=comment)
-    yield reprlib.Attr('type', self.type)
-    yield reprlib.Attr('value', self.value)
-
-    for name, value in self._var_metadata.items():
-      yield reprlib.Attr(name, value)
-
-  def __treescope_repr__(self, path, subtree_renderer):
-    size_bytes = SizeBytes.from_any(self.value)
-    if size_bytes:
-      stats_repr = f' # {size_bytes}'
-      first_line_annotation = treescope.rendering_parts.comment_color(
-        treescope.rendering_parts.text(f'{stats_repr}')
-      )
-    else:
-      first_line_annotation = None
-    children = {'type': self.type, 'value': self.value, **self._var_metadata}
-    return visualization.render_object_constructor(
-      object_type=type(self),
-      attributes=children,
-      path=path,
-      subtree_renderer=subtree_renderer,
-      first_line_annotation=first_line_annotation,
-    )
-
-  def replace(self, value: B) -> VariableState[B]:
-    return VariableState(self.type, value, **self.get_metadata())
-
-  def to_variable(self) -> Variable[A]:
-    # we use object.__new__ to avoid calling __init__ and bypass the
-    # __init__ logic which should not be called twice
-    variable = object.__new__(self.type)
-    object.__setattr__(variable, '_trace_state', tracers.TraceState())
-    object.__setattr__(variable, 'raw_value', self.value)
-    object.__setattr__(variable, '_var_metadata', self.get_metadata().copy())
-    return variable
-
-  def copy(self: VariableState[A]) -> VariableState[A]:
-    return jax.tree.map(lambda x: x, self)
-
-  def get_metadata(self) -> dict[str, tp.Any]:
-    return self._var_metadata
-
-  def add_axis(self, axis_index: AxisIndex, axis_name: AxisName | None):
-    if 'on_add_axis' in self._var_metadata:
-      self._var_metadata['on_add_axis'](self, axis_index, axis_name)
-
-  def remove_axis(self, axis_index: AxisIndex, axis_name: AxisName | None):
-    if 'on_remove_axis' in self._var_metadata:
-      self._var_metadata['on_remove_axis'](self, axis_index, axis_name)
-
-GraphVariableState = VariableState[VariableState[tp.Any]]
-
-def _variable_state_flatten(x: VariableState[tp.Any], *, with_keys: bool):
-  metadata = tuple(x.get_metadata().items())
-  if with_keys:
-    node = (jtu.GetAttrKey('value'), x.value)
-  else:
-    node = x.value
-
-  return (node,), (x.type, metadata)
-
-
-def _variable_state_unflatten(
-  static: tuple[type[Variable[A]], tuple[tuple[str, tp.Any], ...]],
-  children: tuple[A],
-) -> VariableState[A]:
-  return VariableState(
-    type=static[0],
-    value=children[0],
-    **dict(static[1]),
-  )
-
-
-jtu.register_pytree_with_keys(
-  VariableState,
-  partial(_variable_state_flatten, with_keys=True),  # type: ignore
-  _variable_state_unflatten,  # type: ignore
-  flatten_func=partial(_variable_state_flatten, with_keys=False),  # type: ignore
-)
 
 
 def with_metadata(
@@ -1058,13 +1117,13 @@ def with_metadata(
 
 
 def split_flat_state(
-    flat_state: tp.Iterable[tuple[PathParts, Variable | VariableState]],
+    flat_state: tp.Iterable[tuple[PathParts, Variable]],
     filters: tuple[filterlib.Filter, ...],
-) -> tuple[list[tuple[PathParts, Variable | VariableState]], ...]:
+) -> tuple[list[tuple[PathParts, Variable]], ...]:
   predicates = filterlib.filters_to_predicates(filters)
   # we have n + 1 states, where n is the number of predicates
   # the last state is for values that don't match any predicate
-  flat_states: tuple[list[tuple[PathParts, Variable | VariableState]], ...] = (
+  flat_states: tuple[list[tuple[PathParts, Variable]], ...] = (
     tuple([] for _ in predicates)
   )
 
@@ -1075,9 +1134,9 @@ def split_flat_state(
         break
     else:
       raise ValueError(
-          'Non-exhaustive filters, got a non-empty remainder: '
-          f'{path} -> {value}.'
-          '\nUse `...` to match all remaining elements.'
+        'Non-exhaustive filters, got a non-empty remainder: '
+        f'{path} -> {value}.'
+        '\nUse `...` to match all remaining elements.'
       )
 
   return flat_states
@@ -1145,36 +1204,36 @@ _MISSING = _Missing()
 
 @tp.overload
 def register_variable_name(
-    name: str,
-    typ: type[Variable[tp.Any]],
-    *,
-    overwrite: bool = False,
-) -> type[Variable[tp.Any]]:
-  ...
+  name: str,
+  typ: type[Variable[tp.Any]],
+  *,
+  overwrite: bool = False,
+) -> type[Variable[tp.Any]]: ...
 
 
 @tp.overload
 def register_variable_name(
-    name: str,
-    *,
-    overwrite: bool = False,
-) -> tp.Callable[[type[Variable[tp.Any]]], type[Variable[tp.Any]]]:
-  ...
+  name: str,
+  *,
+  overwrite: bool = False,
+) -> tp.Callable[[type[Variable[tp.Any]]], type[Variable[tp.Any]]]: ...
 
 
 def register_variable_name(
-    name: str,
-    typ: type[Variable[A]] | _Missing = _MISSING,
-    *,
-    overwrite=False,
+  name: str,
+  typ: type[Variable[A]] | _Missing = _MISSING,
+  *,
+  overwrite=False,
 ) -> type[Variable[A]] | tp.Callable[[type[Variable[A]]], type[Variable[A]]]:
   """Register a pair of Linen collection name and its NNX type."""
   if typ is _MISSING:
     return partial(register_variable_name, name, overwrite=overwrite)
   typ = tp.cast(type[Variable[A]], typ)
   if not overwrite and name in VariableTypeCache:
-    raise ValueError(f'Name {name} already mapped to type {VariableTypeCache[name]}. '
-                     'To overwrite, call set_variable_name() with `overwrite=True`.')
+    raise ValueError(
+      f'Name {name} already mapped to type {VariableTypeCache[name]}. '
+      'To overwrite, call register_variable_name() with `overwrite=True`.'
+    )
   VariableTypeCache[name] = typ
   return typ
 

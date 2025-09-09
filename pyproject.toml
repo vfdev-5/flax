@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flax"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 description = "Flax: A neural network library for JAX designed for flexibility"
 keywords = []
 authors = [
@@ -14,7 +14,7 @@ dependencies = [
     "numpy>=1.23.2; python_version>='3.11'",
     "numpy>=1.26.0; python_version>='3.12'",
     # keep in sync with jax-version in .github/workflows/build.yml
-    "jax>=0.4.27",
+    "jax>=0.6.0",
     "msgpack",
     "optax",
     "orbax-checkpoint",
@@ -37,9 +37,6 @@ classifiers = [
 dynamic = ["version", "readme"]
 
 [project.optional-dependencies]
-all = [
-    "matplotlib",  # only needed for tensorboard export
-]
 testing = [
     "clu",
     "clu<=0.0.9; python_version<'3.10'",
@@ -57,16 +54,17 @@ testing = [
     "pytest-xdist",
     "pytype",
     # WMT/LM1B examples
-    "sentencepiece",
+    "sentencepiece==0.2.0",  # Segfault bug in 0.2.1
     "tensorflow_text>=2.11.0; platform_system!='Darwin'",
     "tensorflow_datasets",
     "tensorflow>=2.12.0", # to fix Numpy np.bool8 deprecation error
     "torch",
     "treescope>=0.1.1; python_version>='3.10'",
     "cloudpickle>=3.0.0",
+    "ale-py>=0.10.2",
 ]
 docs = [
-    "sphinx>=3.3.1",
+    "sphinx>=4.3.0",
     "sphinx-book-theme",
     "Pygments>=2.6.1",
     "ipykernel",
@@ -76,7 +74,7 @@ docs = [
     "ipython_genutils",
     "sphinx-design",
     "jupytext==1.13.8",
-    "dm-haiku",
+    "dm-haiku>=0.0.14",
     # Need to pin docutils to 0.16 to make bulleted lists appear correctly on
     # ReadTheDocs: https://stackoverflow.com/a/68008428
     "docutils==0.16",
@@ -91,7 +89,9 @@ docs = [
     "ipywidgets>=8.1.5",
 ]
 dev = [
+    "nanobind>=2.5.0",
     "pre-commit>=3.8.0",
+    "scikit-build-core[pyproject]>=0.11.0",
 ]
 
 [project.urls]
@@ -163,8 +163,6 @@ filterwarnings = [
     "ignore:.*the function signature of MultiHeadDotProductAttention's `__call__` method has changed.*:DeprecationWarning",
     # DeprecationWarning: ml_dtypes.float8_e4m3b11 is deprecated.
     "ignore:.*ml_dtypes.float8_e4m3b11 is deprecated.*:DeprecationWarning",
-    # DeprecationWarning: jax.config.define_bool_state is deprecated. Please use other libraries for configuration instead.
-    "ignore:.*jax.config.define_bool_state is deprecated.:DeprecationWarning",
     # pytest-cov uses a deprecated feature of pytest-xdist. (2023-11-06)
     "ignore:The --rsyncdir command line argument and rsyncdirs config variable are deprecated.:DeprecationWarning",
     # DeprecationWarning: jax.random.KeyArray is deprecated.
@@ -187,6 +185,10 @@ filterwarnings = [
     "ignore:.*numpy.core is deprecated.*:DeprecationWarning",
     # DeprecationWarning: shape requires ndarray or scalar arguments
     "ignore:.*shape requires ndarray or scalar arguments.*:DeprecationWarning",
+    # UserWarning: Sharding info not provided when restoring
+    "ignore:.*Sharding info not provided when restoring.*:UserWarning",
+    # UserWarning: pkg_resources is deprecated as an API.
+    "ignore:.*pkg_resources is deprecated as an API.*:UserWarning",
 ]
 
 [tool.coverage.report]
@@ -231,9 +233,3 @@ quote-style = "single"
 [tool.uv]
 # Ignore uv.lock and always upgrade the package to the latest
 upgrade-package = ["jax", "jaxlib", "orbax-checkpoint"]
-
-[dependency-groups]
-dev = [
-    "nanobind>=2.4.0",
-    "scikit-build-core[pyproject]>=0.10.7",
-]

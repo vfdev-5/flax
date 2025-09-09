@@ -23,6 +23,8 @@ _T = TypeVar('_T')
 
 class Config:
   flax_use_flaxlib: bool
+  flax_array_ref: bool
+  flax_pytree_module: bool
   flax_max_repr_depth: int | None
   # See https://google.github.io/pytype/faq.html.
   _HAS_DYNAMIC_ATTRIBUTES = True
@@ -265,6 +267,16 @@ flax_use_flaxlib = bool_flag(
   name='flax_use_flaxlib',
   default=False,
   help='Whether to use flaxlib for C++ acceleration.',
+)
+flax_array_ref = bool_flag(
+  name='flax_array_ref',
+  default=False,
+  help='Whether to use array refs.',
+)
+flax_pytree_module = bool_flag(
+  name='flax_pytree_module',
+  default=True,
+  help='Whether Modules are pytrees by default or not.',
 )
 
 flax_max_repr_depth = int_flag(

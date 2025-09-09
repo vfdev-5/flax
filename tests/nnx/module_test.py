@@ -17,7 +17,6 @@ import dataclasses
 import pickle
 import tempfile
 from typing import TypeVar
-import typing as tp
 
 from absl.testing import absltest
 import cloudpickle
@@ -28,48 +27,127 @@ import numpy as np
 
 A = TypeVar('A')
 
-class List(nnx.Module):
-  def __init__(self, items):
-    self.items = list(items)
+class PytreeTest(absltest.TestCase):
+  def test_pytree(self):
+    class Foo(nnx.Pytree):
+      def __init__(self, a, b):
+        self.a = nnx.data(a)
+        self.b = nnx.static(b)
 
-  def __getitem__(self, idx):
-    return self.items[idx]
+    foo = Foo(a=1, b=2)
 
-  def __setitem__(self, idx, value):
-    self.items[idx] = value
+    self.assertEqual(jax.tree.leaves(foo), [1])
 
+  def test_consistent_attrs(self):
+    class Foo(nnx.Pytree):
+      def __init__(self, a, b, c):
+        self.a = nnx.data(a)
+        self.b = nnx.static(b)
+        self.c = c
 
-class Dict(nnx.Module):
-  @tp.overload
-  def __init__(self, iterable: tp.Iterable[tp.Tuple[str, A]], /): ...
+    foo = Foo(a=1, b=2, c=jnp.array(3))
+    self.assertLen(jax.tree.leaves(foo), 2)
 
-  @tp.overload
-  def __init__(
-    self, mapping: tp.Optional[tp.Mapping[str, A]] = None, /, **kwargs: A
-  ): ...
+    foo.a = 3
+    self.assertLen(jax.tree.leaves(foo), 2)
 
-  def __init__(self, *args, **kwargs):
-    for name, value in dict(*args, **kwargs).items():
-      setattr(self, name, value)
+    foo.a = nnx.static(3)
+    self.assertLen(jax.tree.leaves(foo), 1)
 
-  def __getitem__(self, key) -> A:
-    return getattr(self, key)
+    foo.b = 4  # ok
+    self.assertLen(jax.tree.leaves(foo), 1)
 
-  def __setitem__(self, key, value):
-    setattr(self, key, value)
+    foo.b = nnx.data(4)
+    self.assertLen(jax.tree.leaves(foo), 2)
 
-  def __getattr__(self, key) -> A:
-    return super().__getattribute__(key)
+    foo.c = jnp.array(5)  # ok
+    self.assertLen(jax.tree.leaves(foo), 2)
 
-  def __setattr__(self, key, value):
-    super().__setattr__(key, value)
+    foo.c = nnx.static(5)
+    self.assertLen(jax.tree.leaves(foo), 1)
 
-  def __iter__(self) -> tp.Iterator[str]:
-    return (k for k in vars(self) if k != '_object__state')
+    with self.assertRaisesRegex(
+        ValueError,
+        'Found Arrays on value of type',
+    ):
+      foo.a = ['hi', jnp.array(6)]
 
-  def __len__(self) -> int:
-    return len(vars(self))
+    with self.assertRaisesRegex(
+        ValueError,
+        'Found Arrays in value of type',
+    ):
+      foo.b = nnx.static(jnp.array(4))
 
+  def test_consistent_attrs_frozen_dataclass(self):
+    @dataclasses.dataclass(frozen=True)
+    class Foo(nnx.Pytree):
+      a: nnx.Data[int]
+      b: nnx.Static[int]
+      c: jax.Array
+
+    foo = Foo(a=1, b=2, c=jnp.array(3))
+    self.assertLen(jax.tree.leaves(foo), 2)
+
+  def test_consistent_attrs_dataclass(self):
+    @dataclasses.dataclass
+    class Foo(nnx.Pytree):
+      a: nnx.Data[int]
+      b: nnx.Static[int]
+      c: jax.Array
+
+    foo = Foo(a=1, b=2, c=jnp.array(3))
+    self.assertLen(jax.tree.leaves(foo), 2)
+
+    foo.a = 3
+    self.assertLen(jax.tree.leaves(foo), 2)
+
+    foo.a = nnx.static(3)
+    self.assertLen(jax.tree.leaves(foo), 1)
+
+    foo.b = 4  # ok
+    self.assertLen(jax.tree.leaves(foo), 1)
+
+    foo.b = nnx.data(4)
+    self.assertLen(jax.tree.leaves(foo), 2)
+
+    foo.c = jnp.array(5)  # ok
+    self.assertLen(jax.tree.leaves(foo), 2)
+
+    foo.c = nnx.static(5)
+    self.assertLen(jax.tree.leaves(foo), 1)
+
+    with self.assertRaisesRegex(
+        ValueError,
+        'Found Arrays on value of type',
+    ):
+      foo.a = ['hi', jnp.array(6)]
+
+    with self.assertRaisesRegex(
+        ValueError,
+        'Found Arrays in value of type',
+    ):
+      foo.b = nnx.static(jnp.array(4))
+
+  def test_explicit_dont_change(self):
+    class Foo(nnx.Pytree):
+      def __init__(self):
+        self.b = nnx.data(2)
+
+    foo = Foo()
+    self.assertEqual(jax.tree.leaves(foo), [2])
+    foo.b = "hello"
+    self.assertEqual(jax.tree.leaves(foo), ["hello"])
+
+  def test_no_data_in_static(self):
+    class Foo(nnx.Pytree):
+      def __init__(self):
+        self.a = nnx.static(jnp.array(1))
+
+    with self.assertRaisesRegex(
+        ValueError,
+        'Found Arrays in value of type',
+    ):
+      foo = Foo()
 
 class TestModule(absltest.TestCase):
   def test_has_module_state(self):
@@ -77,10 +155,10 @@ class TestModule(absltest.TestCase):
 
     foo = Foo()
 
-    assert hasattr(foo, '_object__state')
+    assert hasattr(foo, '_pytree__state')
 
   def test_trace_level(self):
-    m = Dict(a=nnx.Param(1))
+    m = nnx.Dict(a=nnx.Param(1))
 
     @jax.jit
     def f():
@@ -93,24 +171,24 @@ class TestModule(absltest.TestCase):
     f()
 
   def test_tree_map(self):
-    m = Dict(a=nnx.Param(1))
+    m = nnx.Dict(a=nnx.Param(1))
 
     graphdef, state = nnx.split(m)
 
     state = jax.tree.map(lambda x: x + 1, state)
 
   def test_split_2(self):
-    m = Dict(a=nnx.Param(1))
+    m = nnx.Dict(a=nnx.Param(1))
 
     graphdef, empty, some = nnx.split(m, None, ...)
 
     some = jax.tree.map(lambda x: x + 1, some)
 
   def test_split_merge(self):
-    m = Dict(a=nnx.Param(1))
+    m = nnx.Dict(a=nnx.Param(1))
 
     @jax.jit
-    def g(graphdef: nnx.GraphDef[Dict], state: nnx.State):
+    def g(graphdef: nnx.GraphDef[nnx.Dict], state: nnx.State):
       m = nnx.merge(graphdef, state)
       m.a = 2
       return nnx.split(m)
@@ -138,8 +216,8 @@ class TestModule(absltest.TestCase):
     assert isinstance(y, jax.Array)
 
   def test_shared_module(self):
-    m1 = Dict(a=nnx.Param(1), b=nnx.Param(2))
-    m2 = Dict(x=m1, y=m1, z=nnx.Param(3))
+    m1 = nnx.Dict(a=nnx.Param(1), b=nnx.Param(2))
+    m2 = nnx.Dict(x=m1, y=m1, z=nnx.Param(3))
 
     m3 = nnx.merge(*nnx.split(m2))
 
@@ -165,10 +243,10 @@ class TestModule(absltest.TestCase):
     r1 = nnx.Variable(1)
     r2 = nnx.Variable(2)
 
-    m = m0 = Dict({'a': List([r1, r2]), 'b': r1})
+    m = m0 = nnx.Dict({'a': nnx.List([r1, r2]), 'b': r1})
 
     @jax.jit
-    def f(graphdef: nnx.GraphDef[Dict], state: nnx.State):
+    def f(graphdef: nnx.GraphDef[nnx.Dict], state: nnx.State):
       m = nnx.merge(graphdef, state)
 
       assert m['a'][0] is m['b']
@@ -188,10 +266,10 @@ class TestModule(absltest.TestCase):
     assert m['b'] is not m0['b']
 
   def test_cross_barrier(self):
-    m = Dict(a=nnx.Param(1))
+    m = nnx.Dict(a=nnx.Param(1))
 
     @jax.jit
-    def g(graphdef: nnx.GraphDef[Dict], state: nnx.State):
+    def g(graphdef: nnx.GraphDef[nnx.Dict], state: nnx.State):
       m = nnx.merge(graphdef, state)
       m.a.value += 1
       return nnx.split(m)
@@ -204,7 +282,7 @@ class TestModule(absltest.TestCase):
 
   def test_no_rejit(self):
     n = 0
-    m = Dict(a=nnx.Param(1))
+    m = nnx.Dict(a=nnx.Param(1))
 
     @jax.jit
     def g(state_and_def):
@@ -236,10 +314,10 @@ class TestModule(absltest.TestCase):
     r1 = nnx.Variable(1)
     r2 = nnx.Variable(2)
     v1 = 3
-    m = Dict(
+    m = nnx.Dict(
       {
-        'a': List([r1, r2, v1]),
-        'b': Dict({'c': r1, 'd': r2}),
+        'a': nnx.List([r1, r2, v1]),
+        'b': nnx.Dict({'c': r1, 'd': r2}),
       }
     )
 
@@ -248,9 +326,9 @@ class TestModule(absltest.TestCase):
     assert len(jax.tree_util.tree_leaves(p)) == 2
 
   def test_clone(self):
-    m = Dict(
-      a=List([nnx.Param(1), nnx.Param(2), 3]),
-      b=Dict(c=nnx.Param(1), d=nnx.Param(2)),
+    m = nnx.Dict(
+      a=nnx.List([nnx.Param(1), nnx.Param(2), 3]),
+      b=nnx.Dict(c=nnx.Param(1), d=nnx.Param(2)),
     )
 
     m2 = nnx.clone(m)
@@ -281,7 +359,7 @@ class TestModule(absltest.TestCase):
 
     intermediates = nnx.pop(m, nnx.Intermediate)
 
-    assert issubclass(intermediates['y'].type, nnx.Intermediate)
+    assert isinstance(intermediates['y'], nnx.Intermediate)
     assert intermediates['y'].value == (3, 11)
 
     assert not hasattr(m, 'y')
@@ -367,13 +445,17 @@ class TestModule(absltest.TestCase):
         self.b = self.a
 
     m1 = Foo()
-    with nnx.update_context('test') as ctx:
-      graphdef, state = ctx.split(m1)
-      m2 = ctx.merge(graphdef, state)
+    with nnx.update_context('test'):
+      with nnx.split_context('test') as ctx:
+        graphdef, state = ctx.split(m1)
+      with nnx.merge_context('test', inner=True) as ctx:
+        m2 = ctx.merge(graphdef, state)
       m2.a.add_field()
-      new_graphdef, state = ctx.split(m2)
+      with nnx.split_context('test') as ctx:
+        new_graphdef, state = ctx.split(m2)
 
-      m3 = ctx.merge(new_graphdef, state)
+      with nnx.merge_context('test', inner=False) as ctx:
+        m3 = ctx.merge(new_graphdef, state)
 
     assert m3 is m1
     assert m1.a.x == 1
@@ -394,13 +476,17 @@ class TestModule(absltest.TestCase):
         self.b = Bar()
 
     m1 = Foo()
-    with nnx.update_context('test') as ctx:
-      graphdef, state = ctx.split(m1)
-      m2 = ctx.merge(graphdef, state)
+    with nnx.update_context('test'):
+      with nnx.split_context('test') as ctx:
+        graphdef, state = ctx.split(m1)
+      with nnx.merge_context('test', inner=True) as ctx:
+        m2 = ctx.merge(graphdef, state)
       m2.add_module()
-      new_graphdef, state = ctx.split(m2)
+      with nnx.split_context('test') as ctx:
+        new_graphdef, state = ctx.split(m2)
 
-      m3 = ctx.merge(new_graphdef, state)
+      with nnx.merge_context('test', inner=False) as ctx:
+        m3 = ctx.merge(new_graphdef, state)
 
     assert m3 is m1
     assert m1.a.x == 1
@@ -417,12 +503,16 @@ class TestModule(absltest.TestCase):
         self.b = self.a
 
     m1 = Foo()
-    with nnx.update_context('test') as ctx:
-      graphdef, state = ctx.split(m1)
-      m2 = ctx.merge(graphdef, state)
+    with nnx.update_context('test'):
+      with nnx.split_context('test') as ctx:
+        graphdef, state = ctx.split(m1)
+      with nnx.merge_context('test', inner=True) as ctx:
+        m2 = ctx.merge(graphdef, state)
       m2.a.x = 2
-      new_graphdef, state = ctx.split(m2)
-      m3 = ctx.merge(new_graphdef, state)
+      with nnx.split_context('test') as ctx:
+        new_graphdef, state = ctx.split(m2)
+      with nnx.merge_context('test', inner=False) as ctx:
+        m3 = ctx.merge(new_graphdef, state)
 
     assert m3 is m1
     assert m1.a.x == 2
@@ -442,12 +532,16 @@ class TestModule(absltest.TestCase):
         self.c = self.a
 
     m1 = Foo()
-    with nnx.update_context('test') as ctx:
-      graphdef, state = ctx.split(m1)
-      m2 = ctx.merge(graphdef, state)
+    with nnx.update_context('test'):
+      with nnx.split_context('test') as ctx:
+        graphdef, state = ctx.split(m1)
+      with nnx.merge_context('test', inner=True) as ctx:
+        m2 = ctx.merge(graphdef, state)
       m2.add_submodule()
-      new_graphdef, state = ctx.split(m2)
-      m3 = ctx.merge(new_graphdef, state)
+      with nnx.split_context('test') as ctx:
+        new_graphdef, state = ctx.split(m2)
+      with nnx.merge_context('test', inner=False) as ctx:
+        m3 = ctx.merge(new_graphdef, state)
 
     assert m3 is m1
     assert hasattr(m1, 'c')
@@ -461,7 +555,7 @@ class TestModule(absltest.TestCase):
   def test_create_abstract_stateful(self):
     linear = nnx.eval_shape(lambda: nnx.Dropout(0.5, rngs=nnx.Rngs(0)))
 
-    assert linear.rngs.default.key.value == jax.ShapeDtypeStruct(
+    assert linear.rngs.key.value == jax.ShapeDtypeStruct(
       (), jax.random.key(0).dtype
     )
 
@@ -606,13 +700,13 @@ class TestModule(absltest.TestCase):
 
     expected_total = sum(int(np.prod(x.value.shape)) for x in leaves)
     expected_total_params = sum(
-      int(np.prod(x.value.shape)) for x in leaves if x.type is nnx.Param
+      int(np.prod(x.value.shape)) for x in leaves if isinstance(x, nnx.Param)
     )
     expected_total_batch_stats = sum(
-      int(np.prod(x.value.shape)) for x in leaves if x.type is nnx.BatchStat
+      int(np.prod(x.value.shape)) for x in leaves if isinstance(x, nnx.BatchStat)
     )
     expected_total_rng_states = sum(
-      int(np.prod(x.value.shape)) for x in leaves if x.type is nnx.RngState
+      int(np.prod(x.value.shape)) for x in leaves if isinstance(x, nnx.RngState)
     )
 
     foo_repr = repr(obj).replace(',', '').splitlines()
@@ -621,42 +715,6 @@ class TestModule(absltest.TestCase):
     self.assertIn(str(expected_total_params), foo_repr[0])
     self.assertIn(str(expected_total_batch_stats), foo_repr[0])
     self.assertIn(str(expected_total_rng_states), foo_repr[0])
-
-
-class TestModulePytree:
-  def test_tree_map(self):
-    class Foo(nnx.Module, experimental_pytree=True):
-      def __init__(self):
-        self.node = nnx.Param(1)
-        self.graphdef = 1
-
-    m = Foo()
-
-    m = jax.tree.map(lambda x: x + 1, m)
-
-    assert m.node.value == 2
-    assert m.graphdef == 1
-
-  def test_static(self):
-    class C(nnx.Module, experimental_pytree=True):
-      def __init__(self, x):
-        self.x = x
-
-    n = 0
-
-    @jax.jit
-    def f(x):
-      nonlocal n
-      n += 1
-
-    f(C(1))
-    assert n == 1
-    f(C(1))
-    assert n == 1
-    f(C(2))
-    assert n == 2
-    f(C(2))
-    assert n == 2
 
 
 class TestModuleDataclass:
@@ -684,13 +742,13 @@ class TestModuleDataclass:
 
     assert len(state) == 4
     assert state['b'].value == 2
-    assert state['b'].type == nnx.Variable
+    assert isinstance(state['b'], nnx.Variable)
     assert state['c'].value == 3
-    assert state['c'].type == nnx.Param
+    assert isinstance(state['c'], nnx.Param)
     assert state['d'].value == 4
-    assert state['d'].type == nnx.Variable
+    assert isinstance(state['d'], nnx.Variable)
     assert state['e'].value == 5
-    assert state['e'].type == nnx.BatchStat
+    assert isinstance(state['e'], nnx.BatchStat)
 
   def test_post_init(self):
 
@@ -728,7 +786,7 @@ class TestModuleDef:
     graphdef, states = nnx.split(foo)
 
     assert isinstance(states, nnx.State)
-    assert issubclass(states['w'].type, nnx.Param)
+    assert isinstance(states['w'], nnx.Param)
 
     y, _updates = graphdef.apply(states)(x=2.0, rngs=nnx.Rngs(e=1))
 
@@ -750,10 +808,10 @@ class TestModuleDef:
 
     graphdef, state = nnx.split(foo)
 
-    assert isinstance(graphdef, nnx.graph.NodeDef | nnx.graph.NodeRef)
+    assert isinstance(graphdef.nodes[0], nnx.graph.NodeDef | nnx.graph.NodeRef)
     assert isinstance(state, nnx.State)
-    assert issubclass(state['w'].type, nnx.Param)
-    assert issubclass(state['c'].type, nnx.Variable)
+    assert isinstance(state['w'], nnx.Param)
+    assert isinstance(state['c'], nnx.Variable)
 
     y, (graphdef, state) = graphdef.apply(state)(x=2.0, rngs=nnx.Rngs(e=1))
 
@@ -762,10 +820,10 @@ class TestModuleDef:
   def test_modules_iterator(self):
     class Foo(nnx.Module):
       def __init__(self, *, rngs: nnx.Rngs):
-        self.submodules = [
+        self.submodules = nnx.data([
           {'a': nnx.Linear(1, 1, rngs=rngs)},
           {'b': nnx.Conv(1, 1, 1, rngs=rngs)},
-        ]
+        ])
         self.linear = nnx.Linear(1, 1, rngs=rngs)
         self.dropout = nnx.Dropout(0.5, rngs=rngs)
 
@@ -788,10 +846,10 @@ class TestModuleDef:
   def test_children_modules_iterator(self):
     class Foo(nnx.Module):
       def __init__(self, *, rngs: nnx.Rngs):
-        self.submodules = [
+        self.submodules = nnx.data([
           {'a': nnx.Linear(1, 1, rngs=rngs)},
           {'b': nnx.Conv(1, 1, 1, rngs=rngs)},
-        ]
+        ])
         self.linear = nnx.Linear(1, 1, rngs=rngs)
         self.dropout = nnx.Dropout(0.5, rngs=rngs)
 
@@ -808,7 +866,7 @@ class TestModuleDef:
   def test_state_in_module(self):
     class Foo(nnx.Module):
       def __init__(self):
-        self.a = nnx.State({'b': nnx.Param(jnp.array(1.0))})
+        self.a = nnx.data(nnx.State({'b': nnx.Param(jnp.array(1.0))}))
 
     foo = Foo()
 

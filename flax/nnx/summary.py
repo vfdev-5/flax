@@ -72,7 +72,7 @@ def _collect_stats(
   ] = defaultdict(lambda: defaultdict())
   node_stats[id(node)] = ObjectInfo(path, stats, variable_groups)
 
-  if isinstance(node, nnx.Object):
+  if isinstance(node, nnx.Pytree):
     node._nnx_tabulate_id = id(node)  # type: ignore
     object_types.add(type(node))
 
@@ -205,7 +205,7 @@ def _call_obj(
     top_method(obj, *input_args, **input_kwargs)
   finally:
     for obj_type, methods in original_methods.items():
-      for name, top_method in methods.items():
+      for name, top_method in methods.items():  # type: ignore[assignment]
         setattr(obj_type, name, top_method)
 
 
@@ -334,9 +334,9 @@ def tabulate(
   _collect_stats((), obj, node_stats, object_types)
   _variable_types: set[type] = {
     nnx.RngState  # type: ignore[misc]
-    if issubclass(variable_state.type, nnx.RngState)
-    else variable_state.type
-    for _, variable_state in nnx.to_flat_state(nnx.state(obj))
+    if isinstance(leaf, nnx.RngState)
+    else type(leaf)
+    for _, leaf in nnx.to_flat_state(nnx.state(obj))
   }
   variable_types: list[type] = sorted(_variable_types, key=lambda t: t.__name__)
 
@@ -404,7 +404,7 @@ def tabulate(
             **metadata,
           }
         elif value_repr:
-          attributes[name] = value_repr
+          attributes[name] = value_repr  # type: ignore[assignment]
 
       if attributes:
         col_repr = _as_yaml_str(attributes) + '\n\n'

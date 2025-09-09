@@ -219,9 +219,7 @@ jax.tree_util.register_pytree_node(
 
 
 class State(MutableMapping[K, V], reprlib.Representable):
-  """A pytree-like structure that contains a ``Mapping`` from hashable and
-  comparable keys to leaves. Leaves can be of any type but :class:`VariableState`
-  and :class:`Variable` are the most common.
+  """A pytree-like ``Mapping`` with hashable and comparable keys.
   """
 
   def __init__(
@@ -466,10 +464,6 @@ jax.tree_util.register_pytree_with_keys(
   partial(_state_unflatten, State),  # type: ignore[arg-type]
 )
 
-class EmptyState(State):
-  def __init__(self):
-    super().__init__({})
-
 def map_state(f: tp.Callable[[tuple, tp.Any], tp.Any], state: State) -> State:
   flat_state = to_flat_state(state)
   result = [
@@ -495,12 +489,25 @@ def from_flat_state(
 def to_pure_dict(
   state, extract_fn: ExtractValueFn | None = None
 ) -> dict[str, tp.Any]:
-  # Works for nnx.Variable and nnx.VariableState
+  # Works for nnx.Variable
   if extract_fn is None:
     extract_fn = lambda x: x.value if hasattr(x, 'value') else x
   flat_values = {k: extract_fn(x) for k, x in to_flat_state(state)}
   return traversals.unflatten_mapping(flat_values)
 
+
+def restore_int_paths(pure_dict: dict[str, tp.Any]):
+  def try_convert_int(x):
+    try:
+      return int(x)
+    except ValueError:
+      return x
+
+  fixed = {
+      tuple(map(try_convert_int, path)): value
+      for path, value in traversals.flatten_mapping(pure_dict).items()
+  }
+  return traversals.unflatten_mapping(fixed)
 
 def replace_by_pure_dict(
   state, pure_dict: dict[str, tp.Any], replace_fn: SetValueFn | None = None
@@ -511,15 +518,21 @@ def replace_by_pure_dict(
     except ValueError:
       return x
 
-  # Works for nnx.Variable and nnx.VariableState
+  # Works for nnx.Variable
   if replace_fn is None:
     replace_fn = lambda x, v: x.replace(v) if hasattr(x, 'replace') else v
   current_flat = dict(to_flat_state(state))
   for kp, v in traversals.flatten_mapping(pure_dict).items():
-    kp = tuple(map(try_convert_int, kp))
-    if kp not in current_flat:
-      raise ValueError(f'key in pure_dict not available in state: {kp}')
-    current_flat[kp] = replace_fn(current_flat[kp], v)
+    # Try exact match first, then integer conversion
+    if kp in current_flat:
+      matched_key = kp
+    else:
+      int_kp = tuple(map(try_convert_int, kp))
+      if int_kp in current_flat:
+        matched_key = int_kp
+      else:
+        raise ValueError(f'key in pure_dict not available in state: {kp}')
+    current_flat[matched_key] = replace_fn(current_flat[matched_key], v)
   state.update(traversals.unflatten_mapping(current_flat))
 
 
@@ -753,7 +766,7 @@ def create_path_filters(state: State):
   flat_state = to_flat_state(state)
   value_paths: dict[tp.Any, set[PathParts]] = {}
   for path, value in flat_state:
-    if isinstance(value, (variablelib.Variable, variablelib.VariableState)):
-      value = value.value
+    if isinstance(value, variablelib.Variable):
+      value = value.raw_value
     value_paths.setdefault(value, set()).add(path)
   return {filterlib.PathIn(*value_paths[value]): value for value in value_paths}

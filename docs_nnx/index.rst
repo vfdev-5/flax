@@ -63,7 +63,7 @@ Features
          .. div:: sd-font-normal
 
             Flax NNX allows fine-grained control of the model's state via
-            its `Filter <https://flax.readthedocs.io/en/latest/nnx/filters_guide.html>`__
+            its `Filter <https://flax.readthedocs.io/en/latest/guides/filters_guide.html>`__
             system.
 
    .. grid-item::
@@ -105,7 +105,7 @@ Basic usage
        return self.linear_out(x)
 
    model = Model(2, 64, 3, rngs=nnx.Rngs(0))  # eager initialization
-   optimizer = nnx.Optimizer(model, optax.adam(1e-3))  # reference sharing
+   optimizer = nnx.Optimizer(model, optax.adam(1e-3), wrt=nnx.Param)
 
    @nnx.jit  # automatic state management for JAX transforms
    def train_step(model, optimizer, x, y):
@@ -114,7 +114,7 @@ Basic usage
        return ((y_pred - y) ** 2).mean()
 
      loss, grads = nnx.value_and_grad(loss_fn)(model)
-     optimizer.update(grads)  # in-place updates
+     optimizer.update(model, grads)  # in-place updates
 
      return loss
 
@@ -189,14 +189,17 @@ Learn more
 
 .. toctree::
    :hidden:
-   :maxdepth: 2
+   :maxdepth: 3
 
    nnx_basics
    mnist_tutorial
    why
-   guides/index
+   key_concepts
+   guides_basic
+   guides_advanced
+   migrating/index
    examples/index
    nnx_glossary
-   The Flax philosophy <https://flax.readthedocs.io/en/latest/philosophy.html>
-   How to contribute <https://flax.readthedocs.io/en/latest/contributing.html>
+   philosophy
+   contributing
    api_reference/index

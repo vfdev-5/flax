@@ -123,8 +123,9 @@ class ScopeTest(absltest.TestCase):
       scope.param('test', nn.initializers.ones_init(), (4,))
 
     msg = (
-      r'Initializer expected to generate shape \(2,\) but got shape \(4,\)'
-      r' instead for parameter "test" in "/"'
+        r'For parameter "test" in "/", the given initializer is expected to'
+        r' generate shape \(4,\), but the existing parameter it received has'
+        r' shape \(2,\).'
     )
     with self.assertRaisesRegex(errors.ScopeParamShapeError, msg):
       apply(f)(freeze({'params': {'test': np.ones((2,))}}))
@@ -196,6 +197,10 @@ class ScopeTest(absltest.TestCase):
     raw_key = random.key_data(key)
     self.assertTrue(scope._is_valid_rng(raw_key))
     self.assertFalse(scope._is_valid_rng(random.split(raw_key)))
+
+  def test_rng_check_w_lazy_rng(self):
+    key = random.key(0)
+    self.assertTrue(scope._is_valid_rng(scope.LazyRng.create(key, 1)))
 
   def test_jax_leak_detector(self):
     with jax.check_tracer_leaks(True):

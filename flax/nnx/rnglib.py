@@ -17,17 +17,16 @@ import functools
 import typing as tp
 
 import jax
+from jax import random
 import jax.numpy as jnp
 
-from flax import struct
+from flax import errors, struct
 from flax.nnx import graph
-from flax.nnx import statelib
-from flax.nnx.statelib import State
+from flax.nnx import variablelib
 from flax.nnx.variablelib import Variable
 from flax.nnx import filterlib
-from flax.nnx.filterlib import All
-from flax.nnx.object import Object
-from flax.typing import MISSING, Missing
+from flax.nnx.pytreelib import Pytree
+from flax.typing import MISSING, Key, Missing
 
 F = tp.TypeVar('F', bound=tp.Callable[..., tp.Any])
 Counts = list[int]
@@ -48,130 +47,315 @@ class RngKey(RngState): ...
 NotKey = filterlib.All(RngState, filterlib.Not(RngKey))
 
 
-class RngStream(Object):
+class RngStream(Pytree):
+
   def __init__(
     self,
+    key: jax.Array | int,
+    *,
     tag: str,
-    key: jax.Array,
-    count: jax.Array,
   ):
-    if not isinstance(key, jax.Array):
-      raise TypeError(f'key must be a jax.Array, got {type(key)}')
+    if isinstance(key, int):
+      key = random.key(key)
+    elif isinstance(key, jax.Array) and key.dtype == jnp.uint32:
+      key = random.wrap_key_data(key)
 
+    if not isinstance(key, jax.Array) or not jnp.issubdtype(key.dtype, jax.dtypes.prng_key):
+      raise ValueError(f'Invalid rng value: {key}, expected a '
+                       f'jax.Array of jax.dtypes.prng_key sub-dtype')
+
+    count = jnp.zeros(key.shape, dtype=jnp.uint32)
+    self.tag = tag
     self.key = RngKey(key, tag=tag)
     self.count = RngCount(count, tag=tag)
 
   def __call__(self) -> jax.Array:
-    self._check_valid_context(
-      lambda: 'Cannot call RngStream from a different trace level'
-    )
-    key = jax.random.fold_in(self.key.value, self.count.value)
-    self.count.value += 1
+    if not self.count.has_ref and not self.count._trace_state.is_valid():
+      raise errors.TraceContextError(
+        f'Cannot mutate {type(self).__name__} from a different trace level'
+      )
+    key = random.fold_in(self.key[...], self.count[...])
+    self.count[...] += 1
     return key
+
+  def fork(self, *, split: int | tuple[int, ...] | None = None):
+    key = self()
+    if split is not None:
+      key = random.split(key, split)
+    return type(self)(key, tag=self.tag)
+
+  if tp.TYPE_CHECKING:
+    bits = staticmethod(functools.partial(random.bits, random.key(0)))
+    uniform = staticmethod(
+      functools.partial(random.uniform, random.key(0))
+    )
+    randint = staticmethod(
+      functools.partial(random.randint, random.key(0))
+    )
+    permutation = staticmethod(
+      functools.partial(random.permutation, random.key(0))
+    )
+    choice = staticmethod(functools.partial(random.choice, random.key(0)))
+    normal = staticmethod(functools.partial(random.normal, random.key(0)))
+    multivariate_normal = staticmethod(
+      functools.partial(random.multivariate_normal, random.key(0))
+    )
+    truncated_normal = staticmethod(
+      functools.partial(random.truncated_normal, random.key(0))
+    )
+    bernoulli = staticmethod(
+      functools.partial(random.bernoulli, random.key(0))
+    )
+    beta = staticmethod(functools.partial(random.beta, random.key(0)))
+    cauchy = staticmethod(functools.partial(random.cauchy, random.key(0)))
+    dirichlet = staticmethod(
+      functools.partial(random.dirichlet, random.key(0))
+    )
+    exponential = staticmethod(
+      functools.partial(random.exponential, random.key(0))
+    )
+    gamma = staticmethod(functools.partial(random.gamma, random.key(0)))
+    loggamma = staticmethod(
+      functools.partial(random.loggamma, random.key(0))
+    )
+    poisson = staticmethod(
+      functools.partial(random.poisson, random.key(0))
+    )
+    gumbel = staticmethod(functools.partial(random.gumbel, random.key(0)))
+    categorical = staticmethod(
+      functools.partial(random.categorical, random.key(0))
+    )
+    laplace = staticmethod(
+      functools.partial(random.laplace, random.key(0))
+    )
+    logistic = staticmethod(
+      functools.partial(random.logistic, random.key(0))
+    )
+    pareto = staticmethod(functools.partial(random.pareto, random.key(0)))
+    t = staticmethod(functools.partial(random.t, random.key(0)))
+    chisquare = staticmethod(
+      functools.partial(random.chisquare, random.key(0))
+    )
+    f = staticmethod(functools.partial(random.f, random.key(0)))
+    rademacher = staticmethod(
+      functools.partial(random.rademacher, random.key(0))
+    )
+    maxwell = staticmethod(
+      functools.partial(random.maxwell, random.key(0))
+    )
+    double_sided_maxwell = staticmethod(
+      functools.partial(random.double_sided_maxwell, random.key(0))
+    )
+    weibull_min = staticmethod(
+      functools.partial(random.weibull_min, random.key(0))
+    )
+    orthogonal = staticmethod(
+      functools.partial(random.orthogonal, random.key(0))
+    )
+    generalized_normal = staticmethod(
+      functools.partial(random.generalized_normal, random.key(0))
+    )
+    ball = staticmethod(functools.partial(random.ball, random.key(0)))
+    rayleigh = staticmethod(
+      functools.partial(random.rayleigh, random.key(0))
+    )
+    wald = staticmethod(functools.partial(random.wald, random.key(0)))
+    geometric = staticmethod(
+      functools.partial(random.geometric, random.key(0))
+    )
+    triangular = staticmethod(
+      functools.partial(random.triangular, random.key(0))
+    )
+    lognormal = staticmethod(
+      functools.partial(random.lognormal, random.key(0))
+    )
+    binomial = staticmethod(
+      functools.partial(random.binomial, random.key(0))
+    )
+    multinomial = staticmethod(
+      functools.partial(random.multinomial, random.key(0))
+    )
+  else:
+
+    def bits(self, *args, **kwargs):
+      return random.bits(self(), *args, **kwargs)
+
+    def uniform(self, *args, **kwargs):
+      return random.uniform(self(), *args, **kwargs)
+
+    def randint(self, *args, **kwargs):
+      return random.randint(self(), *args, **kwargs)
+
+    def permutation(self, *args, **kwargs):
+      return random.permutation(self(), *args, **kwargs)
+
+    def choice(self, *args, **kwargs):
+      return random.choice(self(), *args, **kwargs)
+
+    def normal(self, *args, **kwargs):
+      return random.normal(self(), *args, **kwargs)
+
+    def multivariate_normal(self, *args, **kwargs):
+      return random.multivariate_normal(self(), *args, **kwargs)
+
+    def truncated_normal(self, *args, **kwargs):
+      return random.truncated_normal(self(), *args, **kwargs)
+
+    def bernoulli(self, *args, **kwargs):
+      return random.bernoulli(self(), *args, **kwargs)
+
+    def beta(self, *args, **kwargs):
+      return random.beta(self(), *args, **kwargs)
+
+    def cauchy(self, *args, **kwargs):
+      return random.cauchy(self(), *args, **kwargs)
+
+    def dirichlet(self, *args, **kwargs):
+      return random.dirichlet(self(), *args, **kwargs)
+
+    def exponential(self, *args, **kwargs):
+      return random.exponential(self(), *args, **kwargs)
+
+    def gamma(self, *args, **kwargs):
+      return random.gamma(self(), *args, **kwargs)
+
+    def loggamma(self, *args, **kwargs):
+      return random.loggamma(self(), *args, **kwargs)
+
+    def poisson(self, *args, **kwargs):
+      return random.poisson(self(), *args, **kwargs)
+
+    def gumbel(self, *args, **kwargs):
+      return random.gumbel(self(), *args, **kwargs)
+
+    def categorical(self, *args, **kwargs):
+      return random.categorical(self(), *args, **kwargs)
+
+    def laplace(self, *args, **kwargs):
+      return random.laplace(self(), *args, **kwargs)
+
+    def logistic(self, *args, **kwargs):
+      return random.logistic(self(), *args, **kwargs)
+
+    def pareto(self, *args, **kwargs):
+      return random.pareto(self(), *args, **kwargs)
+
+    def t(self, *args, **kwargs):
+      return random.t(self(), *args, **kwargs)
+
+    def chisquare(self, *args, **kwargs):
+      return random.chisquare(self(), *args, **kwargs)
+
+    def f(self, *args, **kwargs):
+      return random.f(self(), *args, **kwargs)
+
+    def rademacher(self, *args, **kwargs):
+      return random.rademacher(self(), *args, **kwargs)
+
+    def maxwell(self, *args, **kwargs):
+      return random.maxwell(self(), *args, **kwargs)
+
+    def double_sided_maxwell(self, *args, **kwargs):
+      return random.double_sided_maxwell(self(), *args, **kwargs)
+
+    def weibull_min(self, *args, **kwargs):
+      return random.weibull_min(self(), *args, **kwargs)
+
+    def orthogonal(self, *args, **kwargs):
+      return random.orthogonal(self(), *args, **kwargs)
+
+    def generalized_normal(self, *args, **kwargs):
+      return random.generalized_normal(self(), *args, **kwargs)
+
+    def ball(self, *args, **kwargs):
+      return random.ball(self(), *args, **kwargs)
+
+    def rayleigh(self, *args, **kwargs):
+      return random.rayleigh(self(), *args, **kwargs)
+
+    def wald(self, *args, **kwargs):
+      return random.wald(self(), *args, **kwargs)
+
+    def geometric(self, *args, **kwargs):
+      return random.geometric(self(), *args, **kwargs)
+
+    def triangular(self, *args, **kwargs):
+      return random.triangular(self(), *args, **kwargs)
+
+    def lognormal(self, *args, **kwargs):
+      return random.lognormal(self(), *args, **kwargs)
+
+    def binomial(self, *args, **kwargs):
+      return random.binomial(self(), *args, **kwargs)
+
+    def multinomial(self, *args, **kwargs):
+      return random.multinomial(self(), *args, **kwargs)
 
 
 RngValue = tp.Union[int, jax.Array]
-RngDict = tp.Union[
-  tp.Mapping[str, int],
-  tp.Mapping[str, jax.Array],
-  tp.Mapping[str, RngValue],
-]
 
+class Rngs(Pytree):
+  """A small abstraction to manage RNG state.
 
-class Rngs(Object):
-  """NNX rng container class. To instantiate the ``Rngs``, pass
-  in an integer, specifying the starting seed. ``Rngs`` can have
-  different "streams", allowing the user to generate different
-  rng keys. For example, to generate a key for the ``params``
-  and ``dropout`` stream::
+  ``Rngs`` allows the creation of ``RngStream`` which are used to easily generate new unique
+  random keys on demand. An ``RngStream`` is a wrapper around a JAX random ``key``, and a
+  ``counter``. Every time a key is requested, the counter is incremented and the key is
+  generated from the seed key and the counter by using ``jax.random.fold_in``.
+
+  To create an ``Rngs`` pass in an integer or ``jax.random.key`` to the
+  constructor as a keyword argument with the name of the stream. The key will be used as the
+  starting seed for the stream, and the counter will be initialized to zero. Then call the
+  stream to get a key::
 
     >>> from flax import nnx
     >>> import jax, jax.numpy as jnp
 
-    >>> rng1 = nnx.Rngs(0, params=1)
-    >>> rng2 = nnx.Rngs(0)
+    >>> rngs = nnx.Rngs(params=0, dropout=1)
 
-    >>> assert rng1.params() != rng2.dropout()
-
-  Because we passed in ``params=1``, the starting seed for
-  ``params`` is ``1``, whereas the starting seed for ``dropout``
-  defaults to the ``0`` we passed in, since we didn't specify
-  a seed for ``dropout``. If we didn't specify a seed for ``params``,
-  then both streams will default to using the ``0`` we passed in::
-
-    >>> rng1 = nnx.Rngs(0)
-    >>> rng2 = nnx.Rngs(0)
-
-    >>> assert rng1.params() == rng2.dropout()
-
-  The ``Rngs`` container class contains a separate counter for
-  each stream. Every time the stream is called to generate a new rng
-  key, the counter increments by ``1``. To generate a new rng key,
-  we fold in the counter value for the current rng stream into its
-  corresponding starting seed. If we try to generate an rng key for
-  a stream we did not specify on instantiation, then the ``default``
-  stream is used (i.e. the first positional argument passed to ``Rngs``
-  during instantiation is the ``default`` starting seed)::
-
-    >>> rng1 = nnx.Rngs(100, params=42)
-    >>> # `params` stream starting seed is 42, counter is 0
-    >>> assert rng1.params() == jax.random.fold_in(jax.random.key(42), 0)
-    >>> # `dropout` stream starting seed is defaulted to 100, counter is 0
-    >>> assert rng1.dropout() == jax.random.fold_in(jax.random.key(100), 0)
-    >>> # empty stream starting seed is defaulted to 100, counter is 1
-    >>> assert rng1() == jax.random.fold_in(jax.random.key(100), 1)
-    >>> # `params` stream starting seed is 42, counter is 1
-    >>> assert rng1.params() == jax.random.fold_in(jax.random.key(42), 1)
-
-  Let's see an example of using ``Rngs`` in a :class:`Module` and
-  verifying the output by manually threading the ``Rngs``::
-
-    >>> class Model(nnx.Module):
-    ...   def __init__(self, rngs):
-    ...     # Linear uses the `params` stream twice for kernel and bias
-    ...     self.linear = nnx.Linear(2, 3, rngs=rngs)
-    ...     # Dropout uses the `dropout` stream once
-    ...     self.dropout = nnx.Dropout(0.5, rngs=rngs)
-    ...   def __call__(self, x):
-    ...     return self.dropout(self.linear(x))
-
-    >>> def assert_same(x, rng_seed, **rng_kwargs):
-    ...   model = Model(rngs=nnx.Rngs(rng_seed, **rng_kwargs))
-    ...   out = model(x)
+    >>> param_key1 = rngs.params()
+    >>> param_key2 = rngs.params()
+    >>> dropout_key1 = rngs.dropout()
+    >>> dropout_key2 = rngs.dropout()
     ...
-    ...   # manual forward propagation
-    ...   rngs = nnx.Rngs(rng_seed, **rng_kwargs)
-    ...   kernel = nnx.initializers.lecun_normal()(rngs.params(), (2, 3))
-    ...   assert (model.linear.kernel.value==kernel).all()
-    ...   bias = nnx.initializers.zeros_init()(rngs.params(), (3,))
-    ...   assert (model.linear.bias.value==bias).all()
-    ...   mask = jax.random.bernoulli(rngs.dropout(), p=0.5, shape=(1, 3))
-    ...   # dropout scales the output proportional to the dropout rate
-    ...   manual_out = mask * (jnp.dot(x, kernel) + bias) / 0.5
-    ...   assert (out == manual_out).all()
+    >>> assert param_key1 != dropout_key1
 
-    >>> x = jnp.ones((1, 2))
-    >>> assert_same(x, 0)
-    >>> assert_same(x, 0, params=1)
-    >>> assert_same(x, 0, params=1, dropout=2)
+  Trying to generate a key for a stream that was not specified during construction
+  will result in an error being raised::
+
+    >>> rngs = nnx.Rngs(params=0, dropout=1)
+    >>> try:
+    ...   key = rngs.unkown_stream()
+    ... except AttributeError as e:
+    ...   print(e)
+    No RngStream named 'unkown_stream' found in Rngs.
+
+  The ``default`` stream can be created by passing in a key to the constructor without
+  specifying a stream name. When the ``default`` stream is set the ``rngs`` object can be
+  called directly to get a key, and calling streams that were not specified during
+  construction will fallback to ``default``::
+
+    >>> rngs = nnx.Rngs(0, params=1)
+    ...
+    >>> key1 = rngs.default()       # uses 'default'
+    >>> key2 = rngs()               # uses 'default'
+    >>> key3 = rngs.params()        # uses 'params'
+    >>> key4 = rngs.dropout()       # uses 'default'
+    >>> key5 = rngs.unkown_stream() # uses 'default'
   """
 
   def __init__(
     self,
-    default: RngValue | RngDict | None = None,
-    /,
-    **rngs: RngValue,
+    default: RngValue
+    | RngStream
+    | tp.Mapping[str, RngValue | RngStream]
+    | None = None,
+    **rngs: RngValue | RngStream,
   ):
     """
     Args:
-      default: the starting seed for the ``default`` stream. Any
-        key generated from a stream that isn't specified in the
-        ``**rngs`` key-word arguments will default to using this
-        starting seed.
-      **rngs: optional key-word arguments to specify starting
-        seeds for different rng streams. The key-word is the
-        stream name and its value is the corresponding starting
-        seed for that stream.
+      default: the starting seed for the ``default`` stream, defaults to None.
+      **rngs: keyword arguments specifying the starting seed for each stream.
+        The key can be an integer or a ``jax.random.key``.
     """
     if default is not None:
       if isinstance(default, tp.Mapping):
@@ -179,32 +363,23 @@ class Rngs(Object):
       else:
         rngs['default'] = default
 
-    for name, value in rngs.items():
-      if isinstance(value, int):
-        key = jax.random.key(value)
-      elif isinstance(value, jax.Array):
-        if value.dtype == jnp.uint32:
-          key = jax.random.wrap_key_data(value)
-        else:
-          key = value
-      else:
-        raise ValueError(f'Invalid rng value: {value}')
-
+    for tag, key in rngs.items():
+      if isinstance(key, RngStream):
+        key = key.key.value
       stream = RngStream(
-        tag=name,
         key=key,
-        count=jnp.zeros(key.shape, dtype=jnp.uint32),
+        tag=tag,
       )
-      setattr(self, name, stream)
+      setattr(self, tag, stream)
 
   def _get_stream(self, name: str, error_type: type[Exception]) -> RngStream:
-    rngs_vars = vars(self)
-    if name not in rngs_vars:
-      if 'default' not in rngs_vars:
-        raise error_type(f"No RNG named {name!r} or 'default' found in Rngs.")
-      stream = rngs_vars['default']
+    stream_vars = vars(self)
+    if name not in stream_vars:
+      if 'default' not in stream_vars:
+        raise error_type(f"No RngStream named '{name}' found in Rngs.")
+      stream = stream_vars['default']
     else:
-      stream = rngs_vars[name]
+      stream = stream_vars[name]
 
     return stream
 
@@ -217,69 +392,288 @@ class Rngs(Object):
   def __call__(self):
     return self.default()
 
+  if tp.TYPE_CHECKING:
+    bits = staticmethod(functools.partial(random.bits, random.key(0)))
+    uniform = staticmethod(
+      functools.partial(random.uniform, random.key(0))
+    )
+    randint = staticmethod(
+      functools.partial(random.randint, random.key(0))
+    )
+    permutation = staticmethod(
+      functools.partial(random.permutation, random.key(0))
+    )
+    choice = staticmethod(functools.partial(random.choice, random.key(0)))
+    normal = staticmethod(functools.partial(random.normal, random.key(0)))
+    multivariate_normal = staticmethod(
+      functools.partial(random.multivariate_normal, random.key(0))
+    )
+    truncated_normal = staticmethod(
+      functools.partial(random.truncated_normal, random.key(0))
+    )
+    bernoulli = staticmethod(
+      functools.partial(random.bernoulli, random.key(0))
+    )
+    beta = staticmethod(functools.partial(random.beta, random.key(0)))
+    cauchy = staticmethod(functools.partial(random.cauchy, random.key(0)))
+    dirichlet = staticmethod(
+      functools.partial(random.dirichlet, random.key(0))
+    )
+    exponential = staticmethod(
+      functools.partial(random.exponential, random.key(0))
+    )
+    gamma = staticmethod(functools.partial(random.gamma, random.key(0)))
+    loggamma = staticmethod(
+      functools.partial(random.loggamma, random.key(0))
+    )
+    poisson = staticmethod(
+      functools.partial(random.poisson, random.key(0))
+    )
+    gumbel = staticmethod(functools.partial(random.gumbel, random.key(0)))
+    categorical = staticmethod(
+      functools.partial(random.categorical, random.key(0))
+    )
+    laplace = staticmethod(
+      functools.partial(random.laplace, random.key(0))
+    )
+    logistic = staticmethod(
+      functools.partial(random.logistic, random.key(0))
+    )
+    pareto = staticmethod(functools.partial(random.pareto, random.key(0)))
+    t = staticmethod(functools.partial(random.t, random.key(0)))
+    chisquare = staticmethod(
+      functools.partial(random.chisquare, random.key(0))
+    )
+    f = staticmethod(functools.partial(random.f, random.key(0)))
+    rademacher = staticmethod(
+      functools.partial(random.rademacher, random.key(0))
+    )
+    maxwell = staticmethod(
+      functools.partial(random.maxwell, random.key(0))
+    )
+    double_sided_maxwell = staticmethod(
+      functools.partial(random.double_sided_maxwell, random.key(0))
+    )
+    weibull_min = staticmethod(
+      functools.partial(random.weibull_min, random.key(0))
+    )
+    orthogonal = staticmethod(
+      functools.partial(random.orthogonal, random.key(0))
+    )
+    generalized_normal = staticmethod(
+      functools.partial(random.generalized_normal, random.key(0))
+    )
+    ball = staticmethod(functools.partial(random.ball, random.key(0)))
+    rayleigh = staticmethod(
+      functools.partial(random.rayleigh, random.key(0))
+    )
+    wald = staticmethod(functools.partial(random.wald, random.key(0)))
+    geometric = staticmethod(
+      functools.partial(random.geometric, random.key(0))
+    )
+    triangular = staticmethod(
+      functools.partial(random.triangular, random.key(0))
+    )
+    lognormal = staticmethod(
+      functools.partial(random.lognormal, random.key(0))
+    )
+    binomial = staticmethod(
+      functools.partial(random.binomial, random.key(0))
+    )
+    multinomial = staticmethod(
+      functools.partial(random.multinomial, random.key(0))
+    )
+  else:
+
+    def bits(self, *args, **kwargs):
+      return self.default.bits(*args, **kwargs)
+
+    def uniform(self, *args, **kwargs):
+      return self.default.uniform(*args, **kwargs)
+
+    def randint(self, *args, **kwargs):
+      return self.default.randint(*args, **kwargs)
+
+    def permutation(self, *args, **kwargs):
+      return self.default.permutation(*args, **kwargs)
+
+    def choice(self, *args, **kwargs):
+      return self.default.choice(*args, **kwargs)
+
+    def normal(self, *args, **kwargs):
+      return self.default.normal(*args, **kwargs)
+
+    def multivariate_normal(self, *args, **kwargs):
+      return self.default.multivariate_normal(*args, **kwargs)
+
+    def truncated_normal(self, *args, **kwargs):
+      return self.default.truncated_normal(*args, **kwargs)
+
+    def bernoulli(self, *args, **kwargs):
+      return self.default.bernoulli(*args, **kwargs)
+
+    def beta(self, *args, **kwargs):
+      return self.default.beta(*args, **kwargs)
+
+    def cauchy(self, *args, **kwargs):
+      return self.default.cauchy(*args, **kwargs)
+
+    def dirichlet(self, *args, **kwargs):
+      return self.default.dirichlet(*args, **kwargs)
+
+    def exponential(self, *args, **kwargs):
+      return self.default.exponential(*args, **kwargs)
+
+    def gamma(self, *args, **kwargs):
+      return self.default.gamma(*args, **kwargs)
+
+    def loggamma(self, *args, **kwargs):
+      return self.default.loggamma(*args, **kwargs)
+
+    def poisson(self, *args, **kwargs):
+      return self.default.poisson(*args, **kwargs)
+
+    def gumbel(self, *args, **kwargs):
+      return self.default.gumbel(*args, **kwargs)
+
+    def categorical(self, *args, **kwargs):
+      return self.default.categorical(*args, **kwargs)
+
+    def laplace(self, *args, **kwargs):
+      return self.default.laplace(*args, **kwargs)
+
+    def logistic(self, *args, **kwargs):
+      return self.default.logistic(*args, **kwargs)
+
+    def pareto(self, *args, **kwargs):
+      return self.default.pareto(*args, **kwargs)
+
+    def t(self, *args, **kwargs):
+      return self.default.t(*args, **kwargs)
+
+    def chisquare(self, *args, **kwargs):
+      return self.default.chisquare(*args, **kwargs)
+
+    def f(self, *args, **kwargs):
+      return self.default.f(*args, **kwargs)
+
+    def rademacher(self, *args, **kwargs):
+      return self.default.rademacher(*args, **kwargs)
+
+    def maxwell(self, *args, **kwargs):
+      return self.default.maxwell(*args, **kwargs)
+
+    def double_sided_maxwell(self, *args, **kwargs):
+      return self.default.double_sided_maxwell(*args, **kwargs)
+
+    def weibull_min(self, *args, **kwargs):
+      return self.default.weibull_min(*args, **kwargs)
+
+    def orthogonal(self, *args, **kwargs):
+      return self.default.orthogonal(*args, **kwargs)
+
+    def generalized_normal(self, *args, **kwargs):
+      return self.default.generalized_normal(*args, **kwargs)
+
+    def ball(self, *args, **kwargs):
+      return self.default.ball(*args, **kwargs)
+
+    def rayleigh(self, *args, **kwargs):
+      return self.default.rayleigh(*args, **kwargs)
+
+    def wald(self, *args, **kwargs):
+      return self.default.wald(*args, **kwargs)
+
+    def geometric(self, *args, **kwargs):
+      return self.default.geometric(*args, **kwargs)
+
+    def triangular(self, *args, **kwargs):
+      return self.default.triangular(*args, **kwargs)
+
+    def lognormal(self, *args, **kwargs):
+      return self.default.lognormal(*args, **kwargs)
+
+    def binomial(self, *args, **kwargs):
+      return self.default.binomial(*args, **kwargs)
+
+    def multinomial(self, *args, **kwargs):
+      return self.default.multinomial(*args, **kwargs)
+
   def __iter__(self) -> tp.Iterator[str]:
-    for name in vars(self):
-      if name != '_object__state':
+    for name, stream in vars(self).items():
+      if isinstance(stream, RngStream):
         yield name
 
   def __len__(self) -> int:
-    return len(vars(self)) - 1
+    return sum(
+      1 for stream in vars(self).values() if isinstance(stream, RngStream)
+    )
 
   def __contains__(self, name: tp.Any) -> bool:
     return name in vars(self)
 
-  # pickle support
-  def __getstate__(self):
-    return vars(self).copy()
-
-  def __setstate__(self, state):
-    vars(self).update(state)
-
   def items(self):
-    for name in self:
-      yield name, self[name]
+    for name, stream in vars(self).items():
+      if isinstance(stream, RngStream):
+        yield name, stream
 
+  def fork(
+    self,
+    /,
+    *,
+    split: tp.Mapping[filterlib.Filter, int | tuple[int, ...]]
+    | int
+    | None = None,
+  ):
+    """Returns a new Rngs object with new unique RNG keys.
 
-class ForkStates(tp.NamedTuple):
-  split_keys: State
-  split_counts: State
-  broadcast_keys: State
-  broadcast_counts: State
+    Example::
+      >>> from flax import nnx
+      ...
+      >>> rngs = nnx.Rngs(params=1, dropout=2)
+      >>> new_rngs = rngs.fork()
+      ...
+      >>> assert rngs.params() != new_rngs.params()
 
+    ``split`` can be used to split the keys of the newly created ``Rngs`` object::
 
-def fork(
-  state: State,
-  split_filter: filterlib.Filter,
-  split_pattern: SplitPattern,
-) -> ForkStates:
-  if split_pattern is None:
-    raise RuntimeError('Split pattern cannot be None, this is a bug.')
+      >>> rngs = nnx.Rngs(params=1, dropout=2)
+      >>> new_rngs = rngs.fork(split=5)
+      ...
+      >>> assert new_rngs.params.key.shape == (5,)
+      >>> assert new_rngs.dropout.key.shape == (5,)
 
-  num_splits: int | tuple[int, ...]
-  if isinstance(split_pattern, int):
-    num_splits = split_pattern
-  else:
-    num_splits = tuple(x if x is not None else 1 for x in split_pattern)
+    ``split`` also accepts a mapping of
+    `Filters <https://flax.readthedocs.io/en/latest/guides/filters_guide.html>`__  to
+    split sizes or None to control which streams are split and how they are split::
 
-  split_keys, split_counts, broadcast_keys, broadcast_counts = (
-    statelib.split_state(
-      state,
-      All(split_filter, RngKey),
-      All(split_filter, RngCount),
-      RngKey,
-      RngCount,
-    )
-  )
+      >>> rngs = nnx.Rngs(params=1, dropout=2, noise=3)
+      >>> new_rngs = rngs.fork(split={
+      ...  'params': 5,      # split params into 5 keys
+      ...  'dropout': None,  # don't split dropout
+      ...  ...: (2, 5),      # split anything else into 2x5 keys
+      ... })
+      ...
+      >>> assert new_rngs.params.key.shape == (5,)
+      >>> assert new_rngs.dropout.key.shape == ()
+      >>> assert new_rngs.noise.key.shape == (2, 5)
+    """
+    if split is None:
+      split = {}
+    elif isinstance(split, int):
+      split = {...: split}
 
-  def split_key(key: tp.Any) -> jax.Array:
-    if not isinstance(key, jax.Array):
-      raise TypeError(f'key must be a jax.Array, got {type(key)}')
+    split_predicates = {filterlib.to_predicate(k): v for k, v in split.items()}
+    keys: dict[str, RngStream] = {}
+    for name, stream in self.items():
+      for predicate, num_splits in split_predicates.items():
+        if predicate((), stream):
+          keys[name] = stream.fork(split=num_splits)
+          break
+      else:
+        keys[name] = stream.fork()
 
-    return jax.random.split(key, num_splits)
-
-  split_keys = jax.tree.map(split_key, split_keys)
-
-  return ForkStates(split_keys, split_counts, broadcast_keys, broadcast_counts)
+    return Rngs(**keys)
 
 
 StreamBackup = (
@@ -374,8 +768,8 @@ def split_rngs(
     ...   return Model(rngs)
     ...
     >>> model = create_model(rngs)
-    >>> model.dropout.rngs.params.key.shape
-    (5,)
+    >>> model.dropout.rngs.key.shape
+    ()
 
   ``split_rngs`` returns a SplitBackups object that can be used to restore the
   original unsplit rng states using :func:`nnx.restore_rngs`, this is useful
@@ -387,7 +781,7 @@ def split_rngs(
     >>> model = create_model(rngs)
     >>> nnx.restore_rngs(backups)
     ...
-    >>> model.dropout.rngs.params.key.shape
+    >>> model.dropout.rngs.key.shape
     ()
 
   SplitBackups can also be used as a context manager to automatically restore
@@ -398,7 +792,7 @@ def split_rngs(
     >>> with nnx.split_rngs(rngs, splits=5, only='params'):
     ...   model = create_model(rngs)
     ...
-    >>> model.dropout.rngs.params.key.shape
+    >>> model.dropout.rngs.key.shape
     ()
 
     >>> state_axes = nnx.StateAxes({(nnx.Param, 'params'): 0, ...: None})
@@ -410,7 +804,7 @@ def split_rngs(
     ...
     >>> rngs = nnx.Rngs(params=0, dropout=1)
     >>> model = create_model(rngs)
-    >>> model.dropout.rngs.params.key.shape
+    >>> model.dropout.rngs.key.shape
     ()
 
 
@@ -441,18 +835,176 @@ def split_rngs(
       and predicate((*path, 'count'), stream.count)
     ):
       key = stream()
-      backups.append((stream, stream.key.value, stream.count.value))
-      key = jax.random.split(key, splits)
+      backups.append((stream, stream.key.raw_value, stream.count.raw_value))
+      key = random.split(key, splits)
       if squeeze:
         key = key[0]
-      stream.key.value = key
+      if variablelib.is_array_ref(stream.key.raw_value):
+        stream.key.raw_value = variablelib.array_ref(key)  # type: ignore[assignment]
+      else:
+        stream.key.value = key
       if squeeze:
         counts_shape = stream.count.shape
       elif isinstance(splits, int):
         counts_shape = (splits, *stream.count.shape)
       else:
         counts_shape = (*splits, *stream.count.shape)
-      stream.count.value = jnp.zeros(counts_shape, dtype=jnp.uint32)
+
+      count = jnp.zeros(counts_shape, dtype=jnp.uint32)
+      if variablelib.is_array_ref(stream.count.raw_value):
+        stream.count.raw_value = variablelib.array_ref(count)  # type: ignore[assignment]
+      else:
+        stream.count.value = count
+
+  return SplitBackups(backups)
+
+@tp.overload
+def fork_rngs(
+  node: tp.Any,
+  /,
+  *,
+  split: tp.Mapping[filterlib.Filter, int | tuple[int, ...] | None]
+    | int
+    | None = None,
+) -> SplitBackups: ...
+@tp.overload
+def fork_rngs(
+  *,
+  split: tp.Mapping[filterlib.Filter, int | tuple[int, ...] | None]
+    | int
+    | None = None,
+) -> tp.Callable[[F], F]: ...
+def fork_rngs(
+  node: tp.Any = MISSING,
+  /,
+  *,
+  split: tp.Mapping[filterlib.Filter, int | tuple[int, ...] | None]
+    | int
+    | None = None,
+) -> SplitBackups | tp.Callable[[F], F]:
+  """Forks the (nested) Rng states of the given node.
+
+  Args:
+    node: the base node containing the rng states to fork.
+    split: an integer, tuple of integers, or mapping specifying the
+      shape of the forked rng keys. If a mapping, keys are filters selecting
+      which rng states to fork with the corresponding split shape.
+
+  Returns:
+    A SplitBackups iterable if ``node`` is provided, otherwise a
+    decorator that forks the rng states of the inputs to the
+    decorated function.
+
+  Example::
+
+    >>> from flax import nnx
+    ...
+    >>> rngs = nnx.Rngs(params=0, dropout=1)
+    >>> _ = nnx.fork_rngs(rngs, split=5)
+    >>> rngs.params.key.shape, rngs.dropout.key.shape
+    ((5,), (5,))
+
+    >>> rngs = nnx.Rngs(params=0, dropout=1)
+    >>> _ = nnx.fork_rngs(rngs, split=(2, 5))
+    >>> rngs.params.key.shape, rngs.dropout.key.shape
+    ((2, 5), (2, 5))
+
+
+    >>> rngs = nnx.Rngs(params=0, dropout=1)
+    >>> _ = nnx.fork_rngs(rngs, split={'params': 5})
+    >>> rngs.params.key.shape, rngs.dropout.key.shape
+    ((5,), ())
+
+  Once forked, random state can be used with transforms like :func:`nnx.vmap`::
+
+    >>> class Model(nnx.Module):
+    ...   def __init__(self, rngs):
+    ...     self.linear = nnx.Linear(2, 3, rngs=rngs)
+    ...     self.dropout = nnx.Dropout(0.5, rngs=rngs)
+    ...
+    >>> rngs = nnx.Rngs(params=0, dropout=1)
+    >>> _ = nnx.fork_rngs(rngs, split={'params': 5})
+    ...
+    >>> state_axes = nnx.StateAxes({(nnx.Param, 'params'): 0, ...: None})
+    ...
+    >>> @nnx.vmap(in_axes=(state_axes,), out_axes=state_axes)
+    ... def create_model(rngs):
+    ...   return Model(rngs)
+    ...
+    >>> model = create_model(rngs)
+    >>> model.dropout.rngs.key.shape
+    ()
+
+  ``fork_rngs`` returns a SplitBackups object that can be used to restore the
+  original unforked rng states using :func:`nnx.restore_rngs`, this is useful
+  when you only want to fork the rng states temporarily::
+
+    >>> rngs = nnx.Rngs(params=0, dropout=1)
+    ...
+    >>> backups = nnx.fork_rngs(rngs, split={'params': 5})
+    >>> model = create_model(rngs)
+    >>> nnx.restore_rngs(backups)
+    ...
+    >>> model.dropout.rngs.key.shape
+    ()
+
+  SplitBackups can also be used as a context manager to automatically restore
+  the rng states when exiting the context::
+
+    >>> rngs = nnx.Rngs(params=0, dropout=1)
+    ...
+    >>> with nnx.fork_rngs(rngs, split={'params': 5}):
+    ...   model = create_model(rngs)
+    ...
+    >>> model.dropout.rngs.key.shape
+    ()
+
+    >>> state_axes = nnx.StateAxes({(nnx.Param, 'params'): 0, ...: None})
+    ...
+    >>> @nnx.fork_rngs(split={'params': 5})
+    ... @nnx.vmap(in_axes=(state_axes,), out_axes=state_axes)
+    ... def create_model(rngs):
+    ...   return Model(rngs)
+    ...
+    >>> rngs = nnx.Rngs(params=0, dropout=1)
+    >>> model = create_model(rngs)
+    >>> model.dropout.rngs.key.shape
+    ()
+  """
+  if isinstance(node, Missing):
+
+    def fork_rngs_decorator(f: F) -> F:
+      @functools.wraps(f)
+      def fork_rngs_wrapper(*args, **kwargs):
+        with fork_rngs((args, kwargs), split=split):
+          return f(*args, **kwargs)
+
+      return tp.cast(F, fork_rngs_wrapper)
+
+    return fork_rngs_decorator  # type: ignore[bad-return-type]
+
+  if split is None:
+    split = {...: None}
+  elif isinstance(split, int | tuple):
+    split = {...: split}
+
+  predicate_splits = {
+    filterlib.to_predicate(k): v for k, v in split.items()
+  }
+  backups: list[StreamBackup] = []
+  for path, stream in graph.iter_graph(node):
+    for predicate, splits in predicate_splits.items():
+      if (
+        isinstance(stream, RngStream)
+        and predicate((*path, 'key'), stream.key)
+        and predicate((*path, 'count'), stream.count)
+      ):
+        forked_stream = stream.fork(split=splits)
+        # backup the original stream state
+        backups.append((stream, stream.key.raw_value, stream.count.raw_value))
+        # apply the forked key and count to the original stream
+        stream.key.raw_value = forked_stream.key.raw_value
+        stream.count.raw_value = forked_stream.count.raw_value
 
   return SplitBackups(backups)
 
@@ -461,21 +1013,52 @@ def backup_keys(node: tp.Any, /):
   backups: list[StreamBackup] = []
   for _, stream in graph.iter_graph(node):
     if isinstance(stream, RngStream):
-      backups.append((stream, stream.key.value))
+      backups.append((stream, stream.key.raw_value))
   return backups
 
+def _scalars_only(
+  path: tuple[Key, ...], scalar_key: jax.Array, target_shape: tuple[int, ...]
+) -> jax.Array:
+  if target_shape != ():
+    raise ValueError(
+      f'Cannot reseed stream at path {path!r} becuase it has a non-scalar key, '
+      f'found key with shape {target_shape}. If all your multi-dimensional '
+      'keys have unique values on all dimensions, set policy="match_shape", '
+      'else provide a custom reseed policy.'
+    )
+  return scalar_key
 
-def reseed(node, /, **stream_keys: RngValue):
+
+def _match_shape(
+  path: tuple[Key, ...], scalar_key: jax.Array, target_shape: tuple[int, ...]
+) -> jax.Array:
+  if target_shape == ():
+    return scalar_key
+  return random.split(scalar_key, target_shape)
+
+
+def reseed(
+  node,
+  /,
+  *,
+  policy: tp.Literal['scalars_only', 'match_shape']
+  | tp.Callable[
+    [tuple, jax.Array, tuple[int, ...]], jax.Array
+  ] = 'scalars_only',
+  **stream_keys: RngValue,
+):
   """Update the keys of the specified RNG streams with new keys.
 
   Args:
     node: the node to reseed the RNG streams in.
+    policy: defines how the the new scalar key is for each RngStream is used to
+      reseed the stream. If ``'scalars_only'`` is given (the default), an error is raised
+      if the target stream key is not a scalar. If ``'match_shape'`` is given, the new
+      scalar key is split to match the shape of the target stream key. A callable
+      of the form ``(path, scalar_key, target_shape) -> new_key`` can be passed to
+      define a custom reseeding policy.
     **stream_keys: a mapping of stream names to new keys. The keys can be
-      either integers or jax arrays. If an integer is passed in, then the
-      key will be generated using ``jax.random.key``.
-
-  Raises:
-    ValueError: if an existing stream key is not a scalar.
+      either integers or ``jax.random.key``.
 
   Example::
 
@@ -501,24 +1084,28 @@ def reseed(node, /, **stream_keys: RngValue):
     >>> jnp.allclose(y1, y2)
     Array(True, dtype=bool)
   """
-  for _, stream in graph.iter_graph(node):
+  if policy == 'scalars_only':
+    policy = _scalars_only
+  elif policy == 'match_shape':
+    policy = _match_shape
+  elif not callable(policy):
+    raise ValueError(
+      f'policy must be "scalars_only", "match_shape" or a callable, '
+      f'got {policy!r}'
+    )
+  rngs = Rngs(**stream_keys)
+  for path, stream in graph.iter_graph(node):
     if isinstance(stream, RngStream):
       if stream.key.tag in stream_keys:
-        if stream.key.shape != ():
-          raise ValueError(
-            f'Cannot reseed stream {stream.key.tag!r} with a non-scalar key, '
-            f' found key with shape {stream.key.shape}.'
-          )
-        key = stream_keys[stream.key.tag]
-        if isinstance(key, int):
-          key = jax.random.key(key)
-        stream.key.value = key
-        stream.count.value = jnp.array(0, dtype=jnp.uint32)
+        key = rngs[stream.key.tag]()
+        key = policy(path, key, stream.key.shape)
+        stream.key[...] = key
+        stream.count[...] = jnp.zeros(key.shape, dtype=jnp.uint32)
 
 
 def restore_rngs(backups: tp.Iterable[StreamBackup], /):
   for backup in backups:
     stream = backup[0]
-    stream.key.value = backup[1]  # key
+    stream.key.raw_value = backup[1]
     if len(backup) == 3:
-      stream.count.value = backup[2]  # count
+      stream.count.raw_value = backup[2]  # count

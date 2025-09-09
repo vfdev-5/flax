@@ -14,13 +14,15 @@
 
 from __future__ import annotations
 
-from collections import deque
 import contextlib
 import dataclasses
 import functools
 import threading
 import typing as tp
 
+import jax.experimental
+
+from flax import config
 from flax.nnx import filterlib, reprlib, traversals, variablelib
 from flax.nnx import statelib
 from flax.nnx.proxy_caller import (
@@ -28,8 +30,8 @@ from flax.nnx.proxy_caller import (
   CallableProxy,
   DelayedAccessor,
 )
-from flax.nnx.statelib import EmptyState, FlatState, State
-from flax.nnx.variablelib import Variable, VariableState
+from flax.nnx.statelib import FlatState, State
+from flax.nnx.variablelib import Variable, is_array_ref
 from flax.typing import Key, PathParts, is_key_like
 import jax
 import numpy as np
@@ -51,40 +53,102 @@ Node = tp.TypeVar('Node')
 Leaf = tp.TypeVar('Leaf')
 AuxData = tp.TypeVar('AuxData')
 
-StateLeaf = VariableState[tp.Any]
-NodeLeaf = Variable[tp.Any]
-GraphState = State[Key, StateLeaf]
-GraphFlatState = FlatState[StateLeaf]
+
+@jax.tree_util.register_static
+@dataclasses.dataclass(frozen=True, slots=True)
+class NoUpdate: ...
 
 
-def is_state_leaf(x: tp.Any) -> tpe.TypeGuard[StateLeaf]:
-  return isinstance(x, VariableState)
+NO_UPDATE = NoUpdate()
 
 
-def is_node_leaf(x: tp.Any) -> tpe.TypeGuard[NodeLeaf]:
-  return isinstance(x, Variable)
+@jax.tree_util.register_static
+@dataclasses.dataclass(frozen=True, slots=True)
+class Repeated: ...
+
+
+REPEATED = Repeated()
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, slots=True, repr=False)
+class ArrayRefOutput(reprlib.Representable):
+  value: jax.Array
+
+  def __nnx_repr__(self):
+    yield reprlib.Object(type=type(self))
+    yield reprlib.Attr('value', self.value)
+
+  def __treescope_repr__(self, path, subtree_renderer):
+    return treescope.repr_lib.render_object_constructor(
+      object_type=type(self),
+      attributes={
+        'value': self.value,
+      },
+      path=path,
+      subtree_renderer=subtree_renderer,
+    )
+
+
+LeafType = tp.Union[
+  Variable,
+  jax.Array,
+  np.ndarray,
+  variablelib.ArrayRef,
+  ArrayRefOutput,
+  NoUpdate,
+]
+GraphState = State[Key, LeafType]
+GraphFlatState = FlatState[LeafType]
+
+
+def is_node_leaf(x: tp.Any) -> tpe.TypeGuard[LeafType]:
+  return isinstance(x, LeafType) or variablelib.is_array_ref(x)  # type: ignore[misc, arg-type]
+
+
+class IndexMap(dict[Index, tp.Any]):
+  @staticmethod
+  def from_refmap(refmap: RefMap) -> IndexMap:
+    return IndexMap((index, value) for value, index in refmap.items())
+
+
+if config.flax_use_flaxlib:
+  import flaxlib  # type: ignore[import]
+
+  globals()['IndexMap'] = flaxlib.IndexMap
 
 
 # RefMap = dict
-class RefMap(tp.MutableMapping[A, B]):
+class RefMap(tp.MutableMapping[tp.Any, int], reprlib.MappingReprMixin):
   """A mapping that hashes keys by their identity."""
 
   def __init__(
-      self,
-      mapping: tp.Mapping[A, B] | tp.Iterable[tuple[A, B]] | None = None,
-      /,
+    self,
+    mapping: tp.Mapping[tp.Any, int]
+    | tp.Iterable[tuple[tp.Any, int]]
+    | None = None,
+    /,
   ):
-    self._mapping: dict[int, tuple[A, B]] = dict()
+    self._mapping: dict[int, tuple[tp.Any, int]] = dict()
     if mapping is not None:
       self.update(mapping)
 
-  def __getitem__(self, key: A) -> B:
+  @staticmethod
+  def from_indexmap(indexmap: IndexMap) -> RefMap:
+    refmap = RefMap()
+    refmap.update((value, index) for index, value in indexmap.items())
+    return refmap
+
+  def get(self, key: tp.Any, default: int | None = None) -> int | None:  # type: ignore[override]
+    return self._mapping.get(id(key), (None, default))[1]
+
+  def __getitem__(self, key: tp.Any) -> int:
     return self._mapping[id(key)][1]
 
-  def __setitem__(self, key: A, value: B):
+  def __setitem__(self, key: tp.Any, value: int):
     self._mapping[id(key)] = (key, value)
 
-  def __delitem__(self, key: A):
+  def __delitem__(self, key: tp.Any):
     del self._mapping[id(key)]
 
   def __len__(self) -> int:
@@ -93,12 +157,21 @@ class RefMap(tp.MutableMapping[A, B]):
   def __contains__(self, key: tp.Any) -> bool:
     return id(key) in self._mapping
 
-  def __iter__(self) -> tp.Iterator[A]:
+  def __iter__(self) -> tp.Iterator[tp.Any]:
     for key, _ in self._mapping.values():
       yield key
 
-  def items(self) -> tp.ItemsView[A, B]:
+  def items(self) -> tp.ItemsView[tp.Any, int]:
     return self._mapping.values()  # type: ignore
+
+
+# save python version
+PythonRefMap = RefMap
+
+if config.flax_use_flaxlib:
+  import flaxlib  # type: ignore[import]
+
+  globals()['RefMap'] = flaxlib.RefMap
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -123,6 +196,8 @@ class GraphNodeImpl(NodeImplBase[Node, Leaf, AuxData]):
 @dataclasses.dataclass(frozen=True, slots=True)
 class PytreeNodeImpl(NodeImplBase[Node, Leaf, AuxData]):
   unflatten: tp.Callable[[tp.Sequence[tuple[Key, Leaf]], AuxData], Node]
+  set_key: tp.Callable[[Node, Key, Leaf], None] | None
+  pop_key: tp.Callable[[Node, Key], Leaf] | None
 
 
 NodeImpl = tp.Union[
@@ -161,23 +236,32 @@ def register_pytree_node_type(
   type: type,
   flatten: tp.Callable[[Node], tuple[tp.Sequence[tuple[Key, Leaf]], AuxData]],
   unflatten: tp.Callable[[tp.Sequence[tuple[Key, Leaf]], AuxData], Node],
+  *,
+  set_key: tp.Callable[[Node, Key, Leaf], None] | None = None,
+  pop_key: tp.Callable[[Node, Key], Leaf] | None = None,
 ):
   if type in PYTREE_REGISTRY:
     raise ValueError(f'Node type {type} is already registered.')
 
   PYTREE_REGISTRY[type] = PytreeNodeImpl(
-    type=type, flatten=flatten, unflatten=unflatten
+    type=type,
+    flatten=flatten,
+    unflatten=unflatten,
+    set_key=set_key,
+    pop_key=pop_key,
   )
 
 
 def is_node(x: tp.Any) -> bool:
+  if isinstance(x, Variable):
+    return False
   if type(x) in GRAPH_REGISTRY:
     return True
   return is_pytree_node(x)
 
 
 def is_graph_node(x: tp.Any) -> bool:
-  return type(x) in GRAPH_REGISTRY
+  return type(x) in GRAPH_REGISTRY or variablelib.is_array_ref(x) or isinstance(x, variablelib.Variable)
 
 
 def is_node_type(x: type[tp.Any]) -> bool:
@@ -242,27 +326,36 @@ class HashableMapping(tp.Mapping[HA, HB], tp.Hashable):
   def __repr__(self) -> str:
     return repr(self._mapping)
 
+  def update(self, other: tp.Mapping[HA, HB]) -> HashableMapping[HA, HB]:
+    """Updates the mapping with another mapping."""
+    mapping = dict(self._mapping)
+    mapping.update(other)
+    return HashableMapping(mapping, copy=False)
 
+
+@jax.tree_util.register_static
 @dataclasses.dataclass(frozen=True, repr=False)
 class NodeRef(tp.Generic[Node], reprlib.Representable):
-  type: type[Node]
   index: int
 
   def __nnx_repr__(self):
     yield reprlib.Object(type=type(self))
-    yield reprlib.Attr('type', self.type.__name__)
     yield reprlib.Attr('index', self.index)
 
   def __treescope_repr__(self, path, subtree_renderer):
     return treescope.repr_lib.render_object_constructor(
       object_type=type(self),
-      attributes={'type': self.type, 'index': self.index},
+      attributes={'index': self.index},
       path=path,
       subtree_renderer=subtree_renderer,
     )
 
 
-jax.tree_util.register_static(NodeRef)
+if config.flax_use_flaxlib:
+  import flaxlib  # type: ignore[import]
+
+  jax.tree_util.register_static(flaxlib.NodeRef)
+  globals()['NodeRef'] = flaxlib.NodeRef
 
 
 @dataclasses.dataclass(frozen=True, repr=False)
@@ -271,10 +364,17 @@ class VariableDef(reprlib.Representable, tp.Generic[Node]):
   index: int
   outer_index: int | None
   metadata: HashableMapping[str, tp.Any]
+  array_refdef: ArrayRefDef | NodeRef | None
 
   def with_no_outer_index(self) -> VariableDef:
     return VariableDef(
-      type=self.type, index=self.index, outer_index=None, metadata=self.metadata
+      type=self.type,
+      index=self.index,
+      outer_index=None,
+      metadata=self.metadata,
+      array_refdef=self.array_refdef.with_no_outer_index()
+      if isinstance(self.array_refdef, ArrayRefDef)
+      else self.array_refdef,
     )
 
   def with_same_outer_index(self) -> VariableDef:
@@ -283,6 +383,9 @@ class VariableDef(reprlib.Representable, tp.Generic[Node]):
       index=self.index,
       outer_index=self.index,
       metadata=self.metadata,
+      array_refdef=self.array_refdef.with_same_outer_index()
+      if isinstance(self.array_refdef, ArrayRefDef)
+      else self.array_refdef,
     )
 
   def __nnx_repr__(self):
@@ -298,6 +401,7 @@ class VariableDef(reprlib.Representable, tp.Generic[Node]):
       attributes={
         'type': self.type,
         'index': self.index,
+        'outer_index': self.outer_index,
         'metadata': self.metadata,
       },
       path=path,
@@ -305,9 +409,48 @@ class VariableDef(reprlib.Representable, tp.Generic[Node]):
     )
 
 
-jax.tree_util.register_static(VariableDef)
+if config.flax_use_flaxlib:
+  import flaxlib  # type: ignore[import]
+
+  jax.tree_util.register_static(flaxlib.VariableDef)
+  globals()['VariableDef'] = flaxlib.VariableDef
 
 
+@dataclasses.dataclass(frozen=True, repr=False)
+class ArrayRefDef(reprlib.Representable):
+  index: int
+  outer_index: int | None
+
+  def with_no_outer_index(self):
+    return ArrayRefDef(
+      index=self.index,
+      outer_index=None,
+    )
+
+  def with_same_outer_index(self):
+    return ArrayRefDef(
+      index=self.index,
+      outer_index=self.index,
+    )
+
+  def __nnx_repr__(self):
+    yield reprlib.Object(type=type(self))
+    yield reprlib.Attr('index', self.index)
+    yield reprlib.Attr('outer_index', self.outer_index)
+
+  def __treescope_repr__(self, path, subtree_renderer):
+    return treescope.repr_lib.render_object_constructor(
+      object_type=type(self),
+      attributes={
+        'index': self.index,
+        'outer_index': self.outer_index,
+      },
+      path=path,
+      subtree_renderer=subtree_renderer,
+    )
+
+
+@jax.tree_util.register_static
 @dataclasses.dataclass(frozen=True, repr=False, slots=True)
 class NodeDef(tp.Generic[Node], reprlib.Representable):
   """A dataclass that denotes the tree structure of a
@@ -315,55 +458,28 @@ class NodeDef(tp.Generic[Node], reprlib.Representable):
   calling :func:`split` or :func:`graphdef` on the :class:`Module`."""
 
   type: tp.Type[Node]
-  index: int
+  index: int | None
   outer_index: int | None
-  attributes: tuple[
-    tuple[
-      Key,
-      NodeDef[tp.Any] | VariableDef[tp.Any] | NodeRef[tp.Any] | Static[tp.Any],
-    ],
-    ...,
-  ]
+  num_attributes: int
   metadata: tp.Any
 
   def with_no_outer_index(self) -> NodeDef[Node]:
-    attributes = tuple(
-      (
-        key,
-        value.with_no_outer_index()
-        if isinstance(value, NodeDef | VariableDef)
-        else value,
-      )
-      for key, value in self.attributes
-    )
     return NodeDef(
       type=self.type,
       index=self.index,
       outer_index=None,
-      attributes=attributes,
+      num_attributes=self.num_attributes,
       metadata=self.metadata,
     )
 
   def with_same_outer_index(self) -> NodeDef[Node]:
-    attributes = tuple(
-      (
-        key,
-        value.with_same_outer_index()
-        if isinstance(value, NodeDef | VariableDef)
-        else value,
-      )
-      for key, value in self.attributes
-    )
     return NodeDef(
       type=self.type,
       index=self.index,
-      outer_index=self.index if self.index >= 0 else None,
-      attributes=attributes,
+      outer_index=self.index,
+      num_attributes=self.num_attributes,
       metadata=self.metadata,
     )
-
-  def replace(self, **kwargs):
-    return dataclasses.replace(self, **kwargs)
 
   def __nnx_repr__(self):
     yield reprlib.Object(type=type(self))
@@ -371,7 +487,7 @@ class NodeDef(tp.Generic[Node], reprlib.Representable):
     yield reprlib.Attr('type', self.type.__name__)
     yield reprlib.Attr('index', self.index)
     yield reprlib.Attr('outer_index', self.outer_index)
-    yield reprlib.Attr('attributes', self.attributes)
+    yield reprlib.Attr('num_attributes', self.num_attributes)
     yield reprlib.Attr('metadata', self.metadata)
 
   def __treescope_repr__(self, path, subtree_renderer):
@@ -380,13 +496,92 @@ class NodeDef(tp.Generic[Node], reprlib.Representable):
       attributes={
         'type': self.type,
         'index': self.index,
-        'attributes': self.attributes,
+        'outer_index': self.outer_index,
+        'num_attributes': self.num_attributes,
         'metadata': self.metadata,
       },
       path=path,
       subtree_renderer=subtree_renderer,
     )
 
+
+if config.flax_use_flaxlib:
+  import flaxlib  # type: ignore[import]
+
+  jax.tree_util.register_static(flaxlib.NodeDef)
+  globals()['NodeDef'] = flaxlib.NodeDef
+
+NodeDefType = tp.Union[
+  NodeDef[Node],
+  NodeRef[Node],
+  VariableDef[Node],
+  ArrayRefDef,
+]
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class ArrayAttr:
+  pass
+
+
+ARRAY_ATTR = ArrayAttr()
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class MutableArrayAttr:
+  pass
+
+
+MUTABLE_ARRAY_ATTR = MutableArrayAttr()
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class NodeAttr:
+  pass
+
+
+NODE_ATTR = NodeAttr()
+
+AttrType = tp.Union[
+  NodeAttr,
+  ArrayAttr,
+  MutableArrayAttr,
+  'Static[tp.Any]',
+]
+
+
+# GraphDef = tp.Union[NodeDef[Node], NodeRef[Node], VariableDef[Node]]
+@jax.tree_util.register_static
+@dataclasses.dataclass(frozen=True, slots=True)
+class GraphDef(tp.Generic[Node]):
+  nodes: list[NodeDefType[tp.Any]]
+  attributes: list[tuple[Key, AttrType]]
+  num_leaves: int
+
+  def __hash__(self) -> int:
+    return hash((tuple(self.nodes), tuple(self.attributes)))
+
+  def with_no_outer_index(self) -> GraphDef[Node]:
+    return GraphDef(
+      nodes=[
+        node.with_no_outer_index() if not isinstance(node, NodeRef) else node
+        for node in self.nodes
+      ],
+      attributes=self.attributes,
+      num_leaves=self.num_leaves,
+    )
+
+  def with_same_outer_index(self) -> GraphDef[Node]:
+    return GraphDef(
+      nodes=[
+        node.with_same_outer_index() if not isinstance(node, NodeRef) else node
+        for node in self.nodes
+      ],
+      attributes=self.attributes,
+      num_leaves=self.num_leaves,
+    )
+
+  # TODO(cgarciae): remove this method
   def apply(
     self, state: GraphState, *states: GraphState
   ) -> ApplyCaller[tuple[GraphDef[Node], GraphState]]:
@@ -405,60 +600,43 @@ class NodeDef(tp.Generic[Node], reprlib.Representable):
     return CallableProxy(_apply, accessor)  # type: ignore
 
 
-jax.tree_util.register_static(NodeDef)
-
-GraphDef = tp.Union[NodeDef[Node], NodeRef[Node], VariableDef[Node]]
 PureState = tuple[GraphDef[Node], GraphState]
 
 
 @tp.overload
-def flatten(
+def flatten(  # type: ignore[invalid-annotation]
   node: Node,
   /,
   *,
   ref_index: RefMap | None = None,
   ref_outer_index: RefMap | None = None,
-) -> tuple[GraphDef[Node], FlatState[VariableState[tp.Any]]]: ...
+) -> tuple[GraphDef[Node], FlatState[tp.Any]]: ...
 @tp.overload
-def flatten(
+def flatten(  # type: ignore[invalid-annotation]
   node: Node,
   /,
   *,
   with_paths: tp.Literal[True],
-  return_variables: tp.Literal[True],
   ref_index: RefMap | None = None,
   ref_outer_index: RefMap | None = None,
 ) -> tuple[
   GraphDef[Node],
-  FlatState[Variable[tp.Any]],
+  FlatState[tp.Any],
 ]: ...
 @tp.overload
-def flatten(
+def flatten(  # type: ignore[invalid-annotation]
   node: Node,
   /,
   *,
   with_paths: tp.Literal[False],
-  return_variables: tp.Literal[True],
   ref_index: RefMap | None = None,
   ref_outer_index: RefMap | None = None,
 ) -> tuple[
   GraphDef[Node],
-  list[Variable[tp.Any]],
+  list[tp.Any],
 ]: ...
 @tp.overload
-def flatten(
-  node: Node,
-  /,
-  *,
-  return_variables: tp.Literal[True],
-  ref_index: RefMap | None = None,
-  ref_outer_index: RefMap | None = None,
-) -> tuple[
-  GraphDef[Node],
-  FlatState[Variable[tp.Any]],
-]: ...
-@tp.overload
-def flatten(
+def flatten(  # type: ignore[invalid-annotation]
   node: Node,
   /,
   *,
@@ -467,19 +645,18 @@ def flatten(
   ref_outer_index: RefMap | None = None,
 ) -> tuple[
   GraphDef[Node],
-  FlatState[VariableState[tp.Any]] | list[tp.Any],
+  FlatState[tp.Any] | list[tp.Any],
 ]: ...
-def flatten(
+def flatten(  # type: ignore[invalid-annotation]
   node: Node,
   /,
   *,
   with_paths: bool = True,
-  return_variables: bool = False,
   ref_index: RefMap | None = None,
   ref_outer_index: RefMap | None = None,
 ) -> tuple[
   GraphDef[Node],
-  FlatState[VariableState[tp.Any]] | FlatState[Variable[tp.Any]] | list[tp.Any],
+  FlatState[tp.Any] | list[tp.Any],
 ]:
   """Flattens a graph node into a (graphdef, state) pair.
 
@@ -489,26 +666,30 @@ def flatten(
       empty dictionary is created. This argument can be used to flatten a sequence of graph
       nodes that share references.
     with_paths: A boolean that indicates whether to return a FlatState object that includes
-      the paths to VariableState objects, or just a list of the Variable's inner values.
+      the paths, or just a list of the Variable's inner values.
   """
   if ref_index is None:
     ref_index = RefMap()
 
-  leaves: list[StateLeaf | Variable[tp.Any]] = []
+  leaves: list[tp.Any] = []
   path: list[Key] | None = [] if with_paths else None
   paths: list[PathParts] | None = [] if with_paths else None
+  nodes: list[NodeDefType[tp.Any]] = []
+  attributes: list[tuple[Key, AttrType]] = []
   node_impl = get_node_impl(node)
-  if node_impl is None and not isinstance(node, Variable):
-    raise RuntimeError(f'Unsupported type: {type(node)}, this is a bug.')
-  graphdef = _graph_flatten(
+  _graph_flatten(
     node,
     node_impl,
     path,
     ref_index,
     ref_outer_index,
+    nodes,
+    attributes,
     leaves,
     paths,
-    return_variables,
+  )
+  graphdef: GraphDef = GraphDef(
+    nodes=nodes, attributes=attributes, num_leaves=len(leaves)
   )
 
   if paths is not None:
@@ -523,93 +704,152 @@ def _graph_flatten(
   path: list[Key] | None,
   ref_index: RefMap,
   ref_outer_index: RefMap | None,
-  leaves: list[StateLeaf | Variable[tp.Any]],
+  nodes: list[NodeDefType[tp.Any]],
+  attributes: list[tuple[Key, AttrType]],
+  leaves: list[tp.Any],
   paths: list[PathParts] | None,
-  return_variables: bool,
-) -> NodeDef | NodeRef | VariableDef:
-  is_pytree_node_ = isinstance(node_impl, PytreeNodeImpl)
-  is_graph_node_ = isinstance(node_impl, GraphNodeImpl)
-  is_variable = isinstance(node, Variable)
+) -> None:
+  is_pytree_node_ = type(node_impl) is PytreeNodeImpl
 
+  index: int | None
   if not is_pytree_node_ and node in ref_index:
-    return NodeRef(type(node), ref_index[node])
+    nodes.append(NodeRef(index := ref_index[node]))
+    return
 
-  # only cache graph nodes
+  is_graph_node_ = type(node_impl) is GraphNodeImpl
+  is_variable = isinstance(node, Variable)
+  is_array_ref = variablelib.is_array_ref(node)
+
+  # only cache graph nodes, we don't add array refs here
+  # as they are added in the make_mutable_arraydef function
   if is_graph_node_ or is_variable:
     index = len(ref_index)
     ref_index[node] = index
   else:
-    index = -1
+    index = None
+
+  def make_mutable_arraydef(value: variablelib.ArrayRef):
+    if value in ref_index:
+      index = ref_index[value]
+      return NodeRef(index), REPEATED
+    else:
+      index = len(ref_index)
+      ref_index[value] = index
+    output_value: NoUpdate | ArrayRefOutput | variablelib.ArrayRef
+    if ref_outer_index is not None:
+      if value in ref_outer_index:
+        outer_index = ref_outer_index[value]
+        output_value = NO_UPDATE
+        array_refdef = ArrayRefDef(index=index, outer_index=outer_index)
+      else:
+        output_value = ArrayRefOutput(value[...])
+        array_refdef = ArrayRefDef(index=index, outer_index=None)
+    else:
+      output_value = value
+      array_refdef = ArrayRefDef(index=index, outer_index=None)
+    return array_refdef, output_value
 
   if is_variable:
     assert isinstance(node, Variable)
-    if return_variables:
-      leaf = node
-    elif path is None:
-      leaf = node.raw_value
+    assert index is not None
+    prev_inner_value = node.raw_value
+    if variablelib.is_array_ref(prev_inner_value):
+      array_refdef, inner_value = make_mutable_arraydef(prev_inner_value)
     else:
-      leaf = node.to_state()  # type: ignore[assignment]
-    leaves.append(leaf)
-    if path is not None:
-      assert paths is not None
-      paths.append(tuple(path))
+      array_refdef = None
+      inner_value = prev_inner_value
+    if path is None:
+      leaf = inner_value
+    else:
+      leaf = node  # type: ignore[assignment]
+      if inner_value is not prev_inner_value:
+        leaf.raw_value = inner_value
+
     variabledef = VariableDef(
       type=type(node),
       index=index,
       outer_index=ref_outer_index.get(node, None) if ref_outer_index else None,
       metadata=HashableMapping(node._var_metadata),
+      array_refdef=array_refdef,
     )
-    return variabledef
+    if type(inner_value) is not Repeated:
+      assert not isinstance(leaf, Repeated)
+      leaves.append(leaf)
+      if path is not None:
+        assert paths is not None
+        paths.append(tuple(path))
+    nodes.append(variabledef)
+    return
+  elif is_array_ref:
+    array_refdef, leaf = make_mutable_arraydef(node)  # type: ignore[arg-type]
+    if not isinstance(leaf, Repeated):
+      leaves.append(leaf)
+      if path is not None:
+        assert paths is not None
+        paths.append(tuple(path))
+    nodes.append(array_refdef)
+    return
+  elif not is_pytree_node_ and not is_graph_node_:
+    # unkown leaf
+    leaves.append(node)
+    if path is not None:
+      assert paths is not None
+      paths.append(tuple(path))
+    return
 
   if node_impl is None:
     raise RuntimeError(f'Unsupported type: {type(node)}, this is a bug.')
 
-  attributes: list[
-    tuple[Key, Static[tp.Any] | NodeDef[tp.Any] | VariableDef | NodeRef[tp.Any]]
-  ] = []
-
   values, metadata = node_impl.flatten(node)
+  num_attributes = len(values)
+  nodedef = NodeDef(
+    node_impl.type,
+    index,
+    ref_outer_index[node]
+    if is_graph_node_ and ref_outer_index and node in ref_outer_index
+    else None,
+    num_attributes,
+    metadata,
+  )
+  nodes.append(nodedef)
+
   for key, value in values:
     value_node_impl = get_node_impl(value)
     if path is not None:
       path.append(key)
     if value_node_impl is not None or isinstance(value, Variable):
-      nodedef = _graph_flatten(
+      attributes.append((key, NODE_ATTR))
+      _graph_flatten(
         value,
         value_node_impl,
         path,
         ref_index,
         ref_outer_index,
+        nodes,
+        attributes,
         leaves,
         paths,
-        return_variables,
       )
-      attributes.append((key, nodedef))
+    elif variablelib.is_array_ref(value):
+      attributes.append((key, MUTABLE_ARRAY_ATTR))
+      array_refdef, leaf = make_mutable_arraydef(value)
+      if not isinstance(leaf, Repeated):
+        leaves.append(leaf)
+        if paths is not None:
+          paths.append(tuple(path))  # type: ignore
+      nodes.append(array_refdef)
+    elif isinstance(value, (jax.Array, np.ndarray)):
+      attributes.append((key, ARRAY_ATTR))
+      if paths is not None:
+        paths.append(tuple(path))  # type: ignore
+      leaves.append(value)
     else:
-      if isinstance(value, (jax.Array, np.ndarray)):
-        if path is not None:
-          path_str = '/'.join(map(str, path))
-          raise ValueError(
-            f'Arrays leaves are not supported, at {path_str!r}: {value}'
-          )
-        else:
-          raise ValueError(f'Arrays leaves are not supported, found {value}')
-      # static_fields.append((key, value))
       attributes.append((key, Static(value)))
 
     if path is not None:
       path.pop()
 
-  nodedef = NodeDef(
-    type=node_impl.type,  # type: ignore[arg-type]
-    index=index,
-    outer_index=ref_outer_index[node]
-    if is_graph_node_ and ref_outer_index and node in ref_outer_index
-    else None,
-    attributes=tuple(attributes),
-    metadata=metadata,
-  )
-  return nodedef
+  return
 
 
 @dataclasses.dataclass(slots=True)
@@ -617,6 +857,8 @@ class FingerprintContext:
   next_index: int
 
 
+# TODO(cgarciae): the actual fingerprint object is not being used,
+# only the traversal process is still relevant
 def fingerprint(
   node,
   /,
@@ -695,9 +937,7 @@ def _graph_fingerprint(
         append_fn(variable_index)
         for key_value in value._var_metadata.items():
           append_fn(key_value)
-    else:
-      if isinstance(value, (jax.Array, np.ndarray)):
-        raise ValueError(f'Arrays leaves are not supported: {value}')
+    elif not isinstance(value, (jax.Array, np.ndarray)):
       append_fn(value)
 
 
@@ -815,10 +1055,10 @@ def _check_graph_fingerprint(
 
 def _get_sorted_leaves(
   xs: tp.Mapping[tp.Any, tp.Any],
-) -> deque[tp.Any]:
+) -> list[tp.Any]:
   if not isinstance(xs, tp.Mapping):  # type: ignore
     raise TypeError(f'expected Mapping; got {type(xs).__qualname__}')
-  leaves: deque[tp.Any] = deque()
+  leaves: list[tp.Any] = []
 
   def _flatten(xs):
     if not isinstance(xs, tp.Mapping):
@@ -831,13 +1071,14 @@ def _get_sorted_leaves(
   return leaves
 
 
-def unflatten(
+def unflatten(  # type: ignore[invalid-annotation]
   graphdef: GraphDef[Node],
   state: State[Key, tp.Any] | FlatState[tp.Any] | list[tp.Any],
   /,
   *,
-  index_ref: dict[Index, tp.Any] | None = None,
-  outer_index_outer_ref: dict[Index, tp.Any] | None = None,
+  index_ref: IndexMap | None = None,
+  outer_index_outer_ref: IndexMap | None = None,
+  copy_variables: bool = False,
 ) -> Node:
   """Unflattens a graphdef into a node with the given state.
 
@@ -846,86 +1087,160 @@ def unflatten(
     state: A State instance.
     index_ref: A mapping from indexes to nodes references found during the graph
       traversal, defaults to None. If not provided, a new empty dictionary is
-      created. This argument can be used to unflatten a sequence of (graphdef, state)
-      pairs that share the same index space.
-    index_ref_cache: A mapping from indexes to existing nodes that can be reused.
-      When an reference is reused, ``GraphNodeImpl.clear`` is called to leave the
-      object in an empty state and then filled by the unflatten process, as a result
-      existing graph nodes are mutated to have the new content/topology
-      specified by the graphdef.
+      created. This argument can be used to unflatten a sequence of (graphdef,
+      state) pairs that share the same index space.
+    index_ref_cache: A mapping from indexes to existing nodes that can be
+      reused. When an reference is reused, ``GraphNodeImpl.clear`` is called to
+      leave the object in an empty state and then filled by the unflatten
+      process, as a result existing graph nodes are mutated to have the new
+      content/topology specified by the graphdef.
+    copy_variables: If True variables in the state will be copied onto the new
+      new structure, else variables will be shared. Default is False.
   """
   if isinstance(state, (State, dict)):
     leaves = _get_sorted_leaves(state)
   elif isinstance(state, FlatState):
-    leaves = deque(state.leaves)
+    leaves = state.leaves
   elif isinstance(state, list):  # type: ignore
-    leaves = deque(state)
+    leaves = state
   else:
     raise ValueError(f'Unsupported state type: {type(state)}')
   if index_ref is None:
-    index_ref = {}
+    index_ref = IndexMap()
 
-  if isinstance(graphdef, NodeRef):
-    node = index_ref[graphdef.index]
-  else:
-    node_impl = get_node_impl_for_type(graphdef.type)
-    node = _graph_unflatten(
-      graphdef, node_impl, leaves, index_ref, outer_index_outer_ref
-    )
-  if leaves:
+  if len(leaves) != graphdef.num_leaves:
     raise ValueError(
-      f'Incorrect number of leaves: got an extra {len(leaves)} leaves in the state'
+      f'Incorrect number of leaves, expected {graphdef.num_leaves} leaves, but got {len(leaves)}.'
     )
+
+  if len(graphdef.nodes) == 0:
+    # unkown leaf
+    return leaves[0]
+  elif isinstance(nodedef := graphdef.nodes[0], NodeRef):
+    node = index_ref[nodedef.index]
+  else:
+    node_iter = iter(graphdef.nodes)
+    attribute_iter = iter(graphdef.attributes)
+    leaves_iter = iter(leaves)
+    nodedef = next(node_iter)
+    assert not isinstance(nodedef, NodeRef)
+    if isinstance(nodedef, ArrayRefDef):
+      node_impl = None
+    else:
+      node_impl = get_node_impl_for_type(nodedef.type)
+    node = _graph_unflatten(
+      nodedef,
+      node_impl,
+      node_iter,
+      attribute_iter,
+      leaves_iter,
+      index_ref,
+      outer_index_outer_ref,
+      copy_variables,
+    )
+
+    try:
+      next(leaves_iter)
+    except StopIteration:
+      pass
+    else:
+      raise ValueError('Incorrect number of leaves in state.')
 
   return node
 
 
 def _graph_unflatten(
-  nodedef: GraphDef[Node],
+  nodedef: NodeDefType[Node],
   node_impl: NodeImpl[Node, Leaf, AuxData] | None,
-  leaves: deque[tp.Any],
-  index_ref: dict[Index, tp.Any],
-  outer_index_outer_ref: dict[Index, tp.Any] | None,
+  node_iter: tp.Iterator[NodeDefType[Node]],
+  attribute_iter: tp.Iterator[tuple[Key, AttrType]],
+  leaves_iter: tp.Iterator[tp.Any],
+  index_ref: IndexMap,
+  outer_index_outer_ref: IndexMap | None,
+  copy_variables: bool,
 ) -> Node:
   """Recursive helper for graph_unflatten.
 
-  Args:
-    nodedef: A GraphDef instance or an index to a node in the cache.
-    state: A mapping from attribute names to variables or subgraphs.
-    index_to_ref: A mapping from indexes to nodes that have been traversed.
-      If a node is already in the cache, it won't be traversed again.
-    index_ref_cache: A mapping from indexes to existing nodes that can be reused.
-      When an reference is reused, ``GraphNodeImpl.clear`` is called to leave the
-      object in an empty state and then filled by the unflatten process, as a result
-      existing graph nodes are mutated to have the new content/topology
-      specified by the nodedef.
+    Args:
+      nodedef: A GraphDef instance or an index to a node in the cache.
+      state: A mapping from attribute names to variables or subgraphs.
+      index_ref: A mapping from indexes to nodes that have been traversed.
+        If a node is already in the cache, it won't be traversed again.
+      outer_index_outer_ref: A mapping from indexes to existing nodes that can be reused.
+        When an reference is reused, ``GraphNodeImpl.clear`` is called to leave the
+        object in an empty state and then filled by the unflatten process, as a result
+        existing graph nodes are mutated to have the new content/topology
+        specified by the nodedef.
   """
+
+  def get_mutable_array(array_refdef: ArrayRefDef, leaf):
+    assert type(array_refdef) is ArrayRefDef
+    if (
+      outer_index_outer_ref is not None
+      and array_refdef.outer_index is not None
+      and array_refdef.outer_index in outer_index_outer_ref
+    ):
+      # if array ref exists, update it
+      array_ref = outer_index_outer_ref[array_refdef.outer_index]
+      if not variablelib.is_array_ref(array_ref):
+        raise RuntimeError(f'Expected a ArrayRef type but got {array_ref}.')
+      if type(leaf) is not NoUpdate:
+        raise RuntimeError(f'Expected a no update for ArrayRef but got {leaf}.')
+    elif type(leaf) in (NoUpdate, Repeated):
+      raise ValueError(
+        f"Expected a ArrayRefOutput type but got '{leaf.value}.'"
+      )
+    elif type(leaf) is ArrayRefOutput:
+      array_ref = variablelib.array_ref(leaf.value)
+    elif variablelib.is_array_ref(leaf):
+      array_ref = leaf
+    else:
+      # here we allow merging frozen arrays and will not create a new array ref
+      array_ref = leaf
+
+    index_ref[array_refdef.index] = array_ref
+    return array_ref
+
   if type(nodedef) is NodeRef:
     return index_ref[nodedef.index]
 
-  def make_variable(key, variabledef: VariableDef[Variable]) -> tp.Any:
-    if not leaves:
-      raise ValueError('Not enough leaves to unflatten the graph')
+  if type(nodedef) is VariableDef:
+    variabledef = tp.cast(VariableDef[Variable], nodedef)
     # its a unseen variable, create a new one
-    value = leaves.popleft()
+
+    if variabledef.array_refdef is not None:
+      if type(variabledef.array_refdef) is NodeRef:
+        value = index_ref[variabledef.array_refdef.index]
+      else:
+        value = next(leaves_iter)
+        assert type(variabledef.array_refdef) is ArrayRefDef
+        if isinstance(value, Variable):
+          value = value.copy() if copy_variables else value
+          inner_value = value.raw_value
+          array_ref = get_mutable_array(variabledef.array_refdef, inner_value)
+          if array_ref is not inner_value:
+            value.raw_value = array_ref
+        else:
+          # if value is an array or array ref, we need call get_mutable_array
+          # to register it in the index_ref
+          value = get_mutable_array(variabledef.array_refdef, value)
+    else:
+      value = next(leaves_iter)
+      if isinstance(value, Variable) and copy_variables:
+        value = value.copy()
+
     # when idxmap is present, check if the Varable exists there
     # and update existing variables if it does
     if (
       outer_index_outer_ref is not None
+      and variabledef.outer_index is not None
       and variabledef.outer_index in outer_index_outer_ref
     ):
       # if variable exists, update it
       variable = outer_index_outer_ref[variabledef.outer_index]
       if not isinstance(variable, Variable):
-        raise ValueError(
-          f'Expected a Variable type for {key!r}, but got {type(variable)}.'
-        )
+        raise ValueError(f'Expected a Variable type but got {type(variable)}.')
       elif isinstance(value, Variable):
-        raise ValueError(
-          f'Cannot unflatten flat_state containing Variables when using `outer_index_outer_ref`. '
-          f'Got {value!r} for {key!r}.'
-        )
-      elif isinstance(value, VariableState):
         variable.update_from_state(value)
       else:
         variable.raw_value = value
@@ -933,48 +1248,67 @@ def _graph_unflatten(
       # variable reference does not exist outside, create a new one
       if isinstance(value, Variable):
         variable = value
-      elif isinstance(value, VariableState):
-        variable = value.to_variable()
       else:
         variable = variabledef.type.from_metadata(
           value, dict(variabledef.metadata)
         )
     index_ref[variabledef.index] = variable
-    return variable
+    return variable  # type: ignore[return-value]
 
-  if type(nodedef) is VariableDef:
-    return make_variable(
-      None,
-      nodedef,  # type: ignore
-    )
+  if type(nodedef) is ArrayRefDef:
+    leaf = next(leaves_iter)
+    array_ref = get_mutable_array(nodedef, leaf)
+    return array_ref  # type: ignore[return-value]
 
   assert type(nodedef) is NodeDef
   if node_impl is None:
     raise RuntimeError(f'Unsupported type: {nodedef.type}, this is a bug.')
-  if nodedef.index in index_ref:
+  if nodedef.index is not None and nodedef.index in index_ref:
     raise RuntimeError(f'GraphDef index {nodedef.index} already used.')
 
   def _get_children() -> list[tuple[Key, tp.Any]]:
-    children: list[tuple[Key, NodeLeaf | Node]] = []  # type: ignore[invalid-annotation]
+    children: list[tuple[Key, LeafType | Node]] = []  # type: ignore[invalid-annotation]
 
     assert type(nodedef) is NodeDef
-    for key, value in nodedef.attributes:
+    for _ in range(nodedef.num_attributes):
+      key, value = next(attribute_iter)
       if type(value) is Static:
-        children.append((key, value.value))
+        children.append((key, value.value))  # type: ignore[attribute-error]
+      elif type(value) is MutableArrayAttr:
+        array_refdef = next(node_iter)
+        assert (
+          type(array_refdef) is ArrayRefDef or type(array_refdef) is NodeRef
+        )
+        if type(array_refdef) is NodeRef:
+          array_ref = index_ref[array_refdef.index]
+        else:
+          assert type(array_refdef) is ArrayRefDef
+          leaf = next(leaves_iter)
+          array_ref = get_mutable_array(array_refdef, leaf)
+        children.append((key, array_ref))
+      elif type(value) is ArrayAttr:
+        array = next(leaves_iter)
+        children.append((key, array))
       elif type(value) is NodeRef:
-        children.append((key, index_ref[value.index]))
-      elif type(value) is NodeDef:
+        children.append((key, index_ref[value.index]))  # type: ignore[attribute-error]
+      elif type(value) is NodeAttr:
         # if the key is a subgraph we create an empty node
-        subgraphdef = value
-        value_node_impl = get_node_impl_for_type(subgraphdef.type)
-        assert value_node_impl is not None
+        subgraphdef = next(node_iter)
+        if type(subgraphdef) is NodeDef:
+          value_node_impl = get_node_impl_for_type(subgraphdef.type)  # type: ignore[attribute-error]
+        else:
+          value_node_impl = None
         subnode = _graph_unflatten(
-          subgraphdef, value_node_impl, leaves, index_ref, outer_index_outer_ref
+          subgraphdef,
+          value_node_impl,
+          node_iter,
+          attribute_iter,
+          leaves_iter,
+          index_ref,
+          outer_index_outer_ref,
+          copy_variables,
         )
         children.append((key, subnode))
-      elif type(value) is VariableDef:
-        variable = make_variable(key, value)
-        children.append((key, variable))
       else:
         raise RuntimeError(f'Unknown static field: {key!r}')
 
@@ -986,6 +1320,7 @@ def _graph_unflatten(
     assert type(nodedef) is NodeDef
     if (
       outer_index_outer_ref is not None
+      and nodedef.outer_index is not None
       and nodedef.outer_index in outer_index_outer_ref
     ):
       node = outer_index_outer_ref[nodedef.outer_index]
@@ -997,6 +1332,7 @@ def _graph_unflatten(
       node_impl.clear(node)
     else:
       node = node_impl.create_empty(nodedef.metadata)
+    assert nodedef.index is not None
     index_ref[nodedef.index] = node
     node_impl.init(node, _get_children())
   else:
@@ -1014,7 +1350,7 @@ def graph_pop(
   id_to_index: dict[int, Index] = {}
   path_parts: PathParts = ()
   predicates = tuple(filterlib.to_predicate(filter) for filter in filters)
-  flat_states: tuple[dict[PathParts, StateLeaf], ...] = tuple(
+  flat_states: tuple[dict[PathParts, LeafType], ...] = tuple(
     {} for _ in predicates
   )
   _graph_pop(node, id_to_index, path_parts, flat_states, predicates)
@@ -1027,7 +1363,7 @@ def _graph_pop(
   node: tp.Any,
   id_to_index: dict[int, Index],
   path_parts: PathParts,
-  flat_states: tuple[dict[PathParts, StateLeaf], ...],
+  flat_states: tuple[dict[PathParts, LeafType], ...],
   predicates: tuple[filterlib.Predicate, ...],
 ) -> None:
   if not is_node(node):
@@ -1064,14 +1400,14 @@ def _graph_pop(
 
     for state, predicate in zip(flat_states, predicates):
       if predicate(node_path, value):
-        if isinstance(node_impl, PytreeNodeImpl):
+        if node_impl.pop_key is None:
           raise ValueError(
             f'Cannot pop key {name!r} from node of type {type(node).__name__}'
           )
         id_to_index[id(value)] = len(id_to_index)
         node_impl.pop_key(node, name)
         if isinstance(value, Variable):
-          value = value.to_state()
+          value = value
         state[node_path] = value  # type: ignore[index] # mypy is wrong here?
         break
     else:
@@ -1081,8 +1417,8 @@ def _graph_pop(
 
 def _graph_update_dynamic(node: tp.Any, state: tp.Mapping[KeyT, tp.Any]):
   def _update_variable(node: Variable, value):
-    if isinstance(value, VariableState):
-      # updated from VariableState
+    if isinstance(value, Variable):
+      # updated from Variable
       node.update_from_state(value)
     else:
       # updated from raw value
@@ -1092,7 +1428,12 @@ def _graph_update_dynamic(node: tp.Any, state: tp.Mapping[KeyT, tp.Any]):
         # can happen when using standalone Variables with `grad`
         pass
       else:
-        node.raw_value = value
+        if is_array_ref(node.raw_value) and (
+          isinstance(value, jax.Array) or is_array_ref(value)
+        ):
+          node[...] = value[...]
+        else:
+          node.raw_value = value
 
   if isinstance(node, Variable):
     _update_variable(node, state)
@@ -1108,7 +1449,7 @@ def _graph_update_dynamic(node: tp.Any, state: tp.Mapping[KeyT, tp.Any]):
   for key, value in state.items():
     # case 1: new state is being added
     if key not in node_dict:
-      if isinstance(node_impl, PytreeNodeImpl):
+      if node_impl.set_key is None:
         raise ValueError(
           f'Cannot set key {key!r} on immutable node of '
           f'type {type(node).__name__}'
@@ -1121,18 +1462,21 @@ def _graph_update_dynamic(node: tp.Any, state: tp.Mapping[KeyT, tp.Any]):
     current_value = node_dict[key]
 
     # case 2: subgraph is being updated
-    if is_node(current_value):
-      if is_state_leaf(value):
+    if is_array_ref(current_value):
+      current_value[...] = value
+    elif is_node(current_value):
+      if is_node_leaf(value):
         raise ValueError(f'Expected a subgraph for {key!r}, but got: {value!r}')
       _graph_update_dynamic(current_value, value)
-    else:
-      # case 3: state leaf is being updated
-      if not isinstance(current_value, Variable):
-        raise ValueError(
-          f'Trying to update a non-Variable attribute {key!r} with a Variable: '
-          f'{value!r}'
-        )
+    elif isinstance(current_value, Variable):
       _update_variable(current_value, value)
+    elif node_impl.set_key is not None:
+      node_impl.set_key(node, key, value)
+    else:
+      raise ValueError(
+        f'Cannot set key {key!r} on immutable node of '
+        f'type {type(node).__name__}'
+      )
 
 
 # --------------------------------------------------------
@@ -1146,7 +1490,7 @@ class StaticCache(tp.NamedTuple):
   paths: tuple[PathParts, ...]
   variables: list[Variable[tp.Any]]
   new_ref_index: RefMap
-  new_index_ref: dict[Index, tp.Any]
+  new_index_ref: IndexMap
 
   @staticmethod
   def create(
@@ -1155,12 +1499,9 @@ class StaticCache(tp.NamedTuple):
     variables: list[Variable[tp.Any]],
     new_ref_index: RefMap,
   ):
-    new_index_ref = {index: obj for obj, index in new_ref_index.items()}
+    new_index_ref = IndexMap.from_refmap(new_ref_index)
     final_graphdef: GraphDef[tp.Any]
-    if type(graphdef) is NodeDef or type(graphdef) is VariableDef:
-      final_graphdef = graphdef.with_same_outer_index()
-    else:
-      final_graphdef = graphdef
+    final_graphdef = graphdef.with_same_outer_index()
     return StaticCache(
       graphdef=graphdef,
       final_graphdef=final_graphdef,
@@ -1178,7 +1519,7 @@ class GraphContext(threading.local):
   )
   ref_index_stack: list[SplitContext] = dataclasses.field(default_factory=list)
   index_ref_stack: list[MergeContext] = dataclasses.field(default_factory=list)
-  tmp_static_cache: RefMap[tp.Any, StaticCache] | None = None
+  tmp_static_cache: tp.MutableMapping[tp.Any, StaticCache] | None = None
   caching: bool = False
 
 
@@ -1186,7 +1527,7 @@ GRAPH_CONTEXT = GraphContext()
 
 
 @contextlib.contextmanager
-def static_cache(static_cache: RefMap[tp.Any, StaticCache]):
+def static_cache(static_cache: tp.MutableMapping[tp.Any, StaticCache]):
   if GRAPH_CONTEXT.caching:
     yield
     return
@@ -1213,7 +1554,7 @@ def _cached_partial(f: tp.Callable[..., tp.Any], *cached_args):
     >>> import optax
     ...
     >>> model = nnx.Linear(2, 3, rngs=nnx.Rngs(0))
-    >>> optimizer = nnx.Optimizer(model, optax.adamw(1e-3))
+    >>> optimizer = nnx.Optimizer(model, optax.adamw(1e-3), wrt=nnx.Param)
     ...
     >>> @nnx.jit
     ... def train_step(model, optimizer, x, y):
@@ -1221,7 +1562,7 @@ def _cached_partial(f: tp.Callable[..., tp.Any], *cached_args):
     ...     return jnp.mean((model(x) - y) ** 2)
     ...
     ...   loss, grads = nnx.value_and_grad(loss_fn)(model)
-    ...   optimizer.update(grads)
+    ...   optimizer.update(model, grads)
     ...   return loss
     ...
     >>> cached_train_step = nnx.cached_partial(train_step, model, optimizer)
@@ -1249,20 +1590,23 @@ def _cached_partial(f: tp.Callable[..., tp.Any], *cached_args):
   Returns:
     A partial function expecting the remaining arguments to the original function.
   """
-  cache: RefMap[tp.Any, StaticCache] = RefMap()
+  cache: tp.MutableMapping[tp.Any, StaticCache] = PythonRefMap()  # type: ignore
   original_ref_index: RefMap = RefMap()
-  index_ref: dict[Index, tp.Any] = {}
+  index_ref: IndexMap = IndexMap()
   cached_ref_index: RefMap = RefMap()
 
   def create_static_cache(x):
-    if is_graph_node(x):
+    # TODO(cgarciae): support Array attribute updates for graph nodes
+    if is_graph_node(x) or isinstance(x, Variable):
       graphdef, flat_state = flatten(
-        x, with_paths=True, return_variables=True, ref_index=original_ref_index
+        x, with_paths=True, ref_index=original_ref_index
       )
       paths = flat_state.paths
       variables = flat_state.leaves
       # clone but keep the same variable references
-      node_cache = unflatten(graphdef, flat_state, index_ref=index_ref)
+      node_cache = unflatten(
+        graphdef, flat_state, index_ref=index_ref, copy_variables=False
+      )
       cached_new_ref_index = RefMap()
       _fp = fingerprint(
         node_cache,
@@ -1276,7 +1620,11 @@ def _cached_partial(f: tp.Callable[..., tp.Any], *cached_args):
       return node_cache
     return x
 
-  cached_args = jax.tree.map(create_static_cache, cached_args)
+  cached_args = jax.tree.map(
+    create_static_cache,
+    cached_args,
+    is_leaf=lambda x: is_graph_node(x) or isinstance(x, Variable),
+  )
 
   @functools.wraps(f)
   def cache_args_wrapper(*args, **kwargs):
@@ -1299,25 +1647,22 @@ class SplitContext:
   is_inner: bool | None
 
   @tp.overload
-  def split(self, graph_node: A, /) -> tuple[GraphDef[A], GraphState]:
-    ...
+  def split(self, graph_node: A, /) -> tuple[GraphDef[A], GraphState]: ...  # type: ignore[invalid-annotation]
+
+  @tp.overload
+  def split(  # type: ignore[invalid-annotation]
+    self, graph_node: A, first: filterlib.Filter, /
+  ) -> tuple[GraphDef[A], GraphState]: ...
 
   @tp.overload
   def split(
-      self, graph_node: A, first: filterlib.Filter, /
-  ) -> tuple[GraphDef[A], GraphState]:
-    ...
-
-  @tp.overload
-  def split(
-      self,
-      graph_node: A,
-      first: filterlib.Filter,
-      second: filterlib.Filter,
-      /,
-      *filters: filterlib.Filter,
-  ) -> tuple[GraphDef[A], GraphState, tpe.Unpack[tuple[GraphState, ...]]]:
-    ...  # type: ignore[not-supported-yet]
+    self,
+    graph_node: A,
+    first: filterlib.Filter,
+    second: filterlib.Filter,
+    /,
+    *filters: filterlib.Filter,
+  ) -> tuple[GraphDef[A], GraphState, tpe.Unpack[tuple[GraphState, ...]]]: ...  # type: ignore[not-supported-yet]
 
   def split(
     self, node: A, *filters: filterlib.Filter
@@ -1337,62 +1682,58 @@ class SplitContext:
     return graphdef, *states
 
   @tp.overload
-  def flatten(
-      self,
-      graph_node: A,
-      /,
-      *,
-      with_paths: tp.Literal[False],
-  ) -> tuple[GraphDef[A], list[tp.Any]]:
-    ...
+  def flatten(  # type: ignore[invalid-annotation]
+    self,
+    graph_node: A,
+    /,
+    *,
+    with_paths: tp.Literal[False],
+  ) -> tuple[GraphDef[A], list[tp.Any]]: ...
 
   @tp.overload
-  def flatten(
-      self,
-      graph_node: A,
-      /,
-  ) -> tuple[GraphDef[A], FlatState[VariableState[tp.Any]]]:
-    ...
+  def flatten(  # type: ignore[invalid-annotation]
+    self,
+    graph_node: A,
+    /,
+  ) -> tuple[GraphDef[A], FlatState[tp.Any]]: ...
 
   @tp.overload
-  def flatten(
-      self,
-      graph_node: A,
-      first: filterlib.Filter,
-      /,
-  ) -> tuple[GraphDef[A], FlatState[VariableState[tp.Any]]]:
-    ...
+  def flatten(  # type: ignore[invalid-annotation]
+    self,
+    graph_node: A,
+    first: filterlib.Filter,
+    /,
+  ) -> tuple[GraphDef[A], FlatState[tp.Any]]: ...
 
   @tp.overload
-  def flatten(
-      self,
-      graph_node: A,
-      first: filterlib.Filter,
-      second: filterlib.Filter,
-      /,
-      *filters: filterlib.Filter,
+  def flatten(  # type: ignore[invalid-annotation]
+    self,
+    graph_node: A,
+    first: filterlib.Filter,
+    second: filterlib.Filter,
+    /,
+    *filters: filterlib.Filter,
   ) -> tuple[
-      GraphDef[A],
-      FlatState[VariableState[tp.Any]],
-      tpe.Unpack[tuple[FlatState[VariableState[tp.Any]], ...]],
-  ]:
-    ...
+    GraphDef[A],
+    FlatState[tp.Any],
+    tpe.Unpack[tuple[FlatState[tp.Any], ...]],
+  ]: ...
 
-  def flatten(
+  def flatten(  # type: ignore[invalid-annotation]
     self,
     node: A,
     *filters: filterlib.Filter,
     with_paths: bool = True,
   ) -> tuple[
     GraphDef[A],
-    FlatState[VariableState[tp.Any]] | list[tp.Any],
-    tpe.Unpack[tuple[FlatState[VariableState[tp.Any]], ...]],
+    FlatState[tp.Any] | list[tp.Any],
+    tpe.Unpack[tuple[FlatState[tp.Any], ...]],
   ]:
     if not with_paths and filters:
       raise ValueError('Cannot use filters with with_paths=False')
 
     ctx = (
-        current_update_context(self.ctxtag) if self.ctxtag is not None else None
+      current_update_context(self.ctxtag) if self.ctxtag is not None else None
     )
     static_cache = (
       ctx.static_cache if ctx is not None and self.is_inner is False else None
@@ -1400,11 +1741,7 @@ class SplitContext:
     ref_outer_index = (
       ctx.inner_ref_outer_index if ctx and ctx.inner_ref_outer_index else None
     )
-    flat_state: (
-      FlatState[VariableState[tp.Any]]
-      | FlatState[Variable[tp.Any]]
-      | list[tp.Any]
-    )
+    flat_state: FlatState[tp.Any] | list[tp.Any]
     leaves: list[tp.Any]
     if node in self.ref_index:
       # node is already in the ref_index, call flatten which will return a NodeRef
@@ -1430,13 +1767,11 @@ class SplitContext:
 
       if with_paths:
         paths = node_static_cache.paths
-        leaves = [
-          variable.to_state() for variable in node_static_cache.variables
-        ]
+        leaves = node_static_cache.variables
       else:
         paths = None
         leaves = [
-            variable.raw_value for variable in node_static_cache.variables
+          variable.raw_value for variable in node_static_cache.variables
         ]
     else:
       graphdef, flat_state = flatten(
@@ -1483,15 +1818,15 @@ def split_context(ctxtag: tp.Hashable | None = None):
 @dataclasses.dataclass
 class MergeContext:
   ctxtag: tp.Hashable | None
-  index_ref: dict[Index, tp.Any]
+  index_ref: IndexMap
   is_inner: bool | None
 
-  def merge(
+  def merge(  # type: ignore[invalid-annotation]
     self,
     graphdef: GraphDef[A],
-    state: GraphState | VariableState,
+    state: GraphState,
     /,
-    *states: GraphState | VariableState,
+    *states: GraphState,
   ) -> A:
     ctx = (
       current_update_context(self.ctxtag) if self.ctxtag is not None else None
@@ -1506,10 +1841,11 @@ class MergeContext:
       _state,
       index_ref=self.index_ref,
       outer_index_outer_ref=outer_index_outer_ref,
+      copy_variables=True,
     )
     return node
 
-  def unflatten(
+  def unflatten(  # type: ignore[invalid-annotation]
     self,
     graphdef: GraphDef[A],
     flat_state: GraphFlatState | list[tp.Any],
@@ -1517,7 +1853,7 @@ class MergeContext:
     *flat_states: GraphFlatState,
   ) -> A:
     ctx = (
-        current_update_context(self.ctxtag) if self.ctxtag is not None else None
+      current_update_context(self.ctxtag) if self.ctxtag is not None else None
     )
     static_cache = (
       ctx.static_cache if ctx is not None and self.is_inner is False else None
@@ -1533,7 +1869,7 @@ class MergeContext:
     else:
       state = FlatState.merge(flat_state, *flat_states)
 
-    if type(graphdef) is NodeRef:
+    if type(graphdef.nodes[0]) is NodeRef:
       node = unflatten(
         graphdef,
         state,
@@ -1541,9 +1877,9 @@ class MergeContext:
       )
 
     elif static_cache is not None:
-      assert isinstance(graphdef, NodeDef)
+      assert isinstance(graphdef.nodes[0], NodeDef)
       assert ctx is not None
-      if (outer_index := graphdef.outer_index) is not None:
+      if (outer_index := graphdef.nodes[0].outer_index) is not None:
         outer_index_outer_ref = ctx.outer_index_outer_ref
         assert outer_index_outer_ref is not None
         node = outer_index_outer_ref[outer_index]
@@ -1568,7 +1904,7 @@ class MergeContext:
               f'leaves in the state, got {len(leaves)}'
             )
           for variable, leaf in zip(static_cache_node.variables, leaves):
-            if type(leaf) is VariableState:
+            if isinstance(leaf, Variable):
               variable.update_from_state(leaf)
             else:
               variable.raw_value = leaf
@@ -1576,10 +1912,10 @@ class MergeContext:
         else:
           # uncached node, create it
           node = unflatten(
-              graphdef,
-              state,
-              index_ref=self.index_ref,
-              outer_index_outer_ref=outer_index_outer_ref,
+            graphdef,
+            state,
+            index_ref=self.index_ref,
+            outer_index_outer_ref=outer_index_outer_ref,
           )
       else:  # graphdef.outer_index is None
         # its a new node, create it
@@ -1603,13 +1939,15 @@ class MergeContext:
 
 @tp.overload
 @contextlib.contextmanager
-def merge_context(): ...
+def merge_context() -> tp.Generator[MergeContext, None, None]: ...  # type: ignore[bad-return-type]
 @tp.overload
 @contextlib.contextmanager
-def merge_context(inner: bool | None, ctxtag: tp.Hashable | None): ...
+def merge_context(
+  ctxtag: tp.Hashable | None, inner: bool | None
+) -> tp.Generator[MergeContext, None, None]: ...  # type: ignore[bad-return-type]
 @contextlib.contextmanager
-def merge_context(inner: bool | None = None, ctxtag: tp.Hashable | None = None):
-  GRAPH_CONTEXT.index_ref_stack.append(MergeContext(ctxtag, {}, inner))
+def merge_context(ctxtag: tp.Hashable | None = None, inner: bool | None = None):
+  GRAPH_CONTEXT.index_ref_stack.append(MergeContext(ctxtag, IndexMap(), inner))
 
   try:
     yield GRAPH_CONTEXT.index_ref_stack[-1]
@@ -1625,17 +1963,18 @@ def merge_context(inner: bool | None = None, ctxtag: tp.Hashable | None = None):
     del unflatten_ctx.ctxtag
 
 
+@jax.tree_util.register_static
 @dataclasses.dataclass
 class UpdateContext:
   """A context manager for handling complex state updates."""
 
   tag: tp.Hashable
   outer_ref_outer_index: RefMap | None
-  outer_index_inner_ref: dict[Index, tp.Any] | None
+  outer_index_inner_ref: IndexMap | None
   # reverse caches
-  outer_index_outer_ref: dict[Index, tp.Any] | None
+  outer_index_outer_ref: IndexMap | None
   inner_ref_outer_index: RefMap | None
-  static_cache: RefMap[tp.Any, StaticCache] | None
+  static_cache: tp.MutableMapping[tp.Any, StaticCache] | None
 
   # define hash and eq to make this an opaque object
   def __hash__(self):
@@ -1648,156 +1987,19 @@ class UpdateContext:
     if self.outer_ref_outer_index is None:
       # outer split (1), store the references
       self.outer_ref_outer_index = ref_index
-      self.outer_index_outer_ref = {
-        index: obj for obj, index in self.outer_ref_outer_index.items()
-      }
+      self.outer_index_outer_ref = IndexMap.from_refmap(
+        self.outer_ref_outer_index
+      )
     else:
       # inner split (3), clear index_ref
       self.outer_index_inner_ref = None
       self.inner_ref_outer_index = None
 
-  def unflatten_end(self, index_ref: dict[Index, tp.Any], inner_merge: bool):
+  def unflatten_end(self, index_ref: IndexMap, inner_merge: bool):
     if inner_merge:
       # inner merge (2)
       self.outer_index_inner_ref = index_ref
-      self.inner_ref_outer_index = RefMap(
-          (obj, index) for index, obj in index_ref.items()
-      )
-
-  @tp.overload
-  def split(self, graph_node: A, /) -> tuple[GraphDef[A], GraphState]:
-    ...
-
-  @tp.overload
-  def split(
-      self, graph_node: A, first: filterlib.Filter, /
-  ) -> tuple[GraphDef[A], GraphState]:
-    ...
-
-  @tp.overload
-  def split(
-      self,
-      graph_node: A,
-      first: filterlib.Filter,
-      second: filterlib.Filter,
-      /,
-      *filters: filterlib.Filter,
-  ) -> tuple[GraphDef[A], GraphState, tpe.Unpack[tuple[GraphState, ...]]]:
-    ...
-
-  def split(
-    self, node: A, *filters: filterlib.Filter
-  ) -> tuple[GraphDef[A], GraphState, tpe.Unpack[tuple[GraphState, ...]]]:
-    """Split a graph node into a :class:`GraphDef` and one or more :class:`State`s. State is
-    a ``Mapping`` from strings or integers to ``Variables``, Arrays or nested States. GraphDef
-    contains all the static information needed to reconstruct a ``Module`` graph, it is analogous
-    to JAX’s ``PyTreeDef``. :func:`split` is used in conjunction with :func:`merge` to switch
-    seamlessly between stateful and stateless representations of the graph.
-
-    Example usage::
-
-      >>> from flax import nnx
-      >>> import jax, jax.numpy as jnp
-      ...
-      >>> class Foo(nnx.Module):
-      ...   def __init__(self, rngs):
-      ...     self.batch_norm = nnx.BatchNorm(2, rngs=rngs)
-      ...     self.linear = nnx.Linear(2, 3, rngs=rngs)
-      ...
-      >>> node = Foo(nnx.Rngs(0))
-      >>> graphdef, params, batch_stats = nnx.split(node, nnx.Param, nnx.BatchStat)
-      ...
-      >>> jax.tree.map(jnp.shape, params)
-      State({
-        'batch_norm': {
-          'bias': VariableState(
-            type=Param,
-            value=(2,)
-          ),
-          'scale': VariableState(
-            type=Param,
-            value=(2,)
-          )
-        },
-        'linear': {
-          'bias': VariableState(
-            type=Param,
-            value=(3,)
-          ),
-          'kernel': VariableState(
-            type=Param,
-            value=(2, 3)
-          )
-        }
-      })
-      >>> jax.tree.map(jnp.shape, batch_stats)
-      State({
-        'batch_norm': {
-          'mean': VariableState(
-            type=BatchStat,
-            value=(2,)
-          ),
-          'var': VariableState(
-            type=BatchStat,
-            value=(2,)
-          )
-        }
-      })
-
-    Arguments:
-      node: graph node to split.
-      *filters: some optional filters to group the state into mutually exclusive substates.
-    Returns:
-      :class:`GraphDef` and one or more :class:`State`'s equal to the number of filters passed. If no
-      filters are passed, a single :class:`State` is returned.
-    """
-    ref_index: RefMap = RefMap()
-    graphdef, flat_state = flatten(
-      node, ref_index=ref_index, ref_outer_index=self.inner_ref_outer_index
-    )
-    flat_states = _split_state(flat_state, filters)
-    states = _to_nested_state(graphdef, flat_states)
-    assert len(states) >= 1
-    self.flatten_end(ref_index)
-    return graphdef, *states  # type: ignore[return-value]
-
-  def merge(
-    self,
-    graphdef: GraphDef[A],
-    state: GraphState,
-    *states: GraphState,
-  ) -> A:
-    """merge"""
-    if not isinstance(graphdef, NodeDef):
-      raise ValueError(
-        f'Expected a NodeDef instance, but got {type(graphdef)}.'
-      )
-    if self.outer_ref_outer_index is None:
-      raise ValueError('Cannot merge without ref_index.')
-
-    if self.outer_ref_outer_index is not None:
-      # outer merge (4), create index_ref_cache
-      index_ref_cache = self.outer_index_outer_ref
-      assert index_ref_cache is not None
-    else:
-      # inner merge (2)
-      index_ref_cache = None
-
-    _state = _merge_to_flat_state((state, *states))
-    index_ref: dict[Index, tp.Any] = {}
-    node = unflatten(
-      graphdef,
-      _state,
-      index_ref=index_ref,
-      outer_index_outer_ref=index_ref_cache,
-    )
-
-    self.unflatten_end(index_ref, True)
-
-    return node
-
-
-jax.tree_util.register_static(UpdateContext)
+      self.inner_ref_outer_index = RefMap.from_indexmap(index_ref)
 
 
 @dataclasses.dataclass
@@ -1805,7 +2007,6 @@ class UpdateContextManager:
   tag: tp.Hashable
 
   def __enter__(self):
-
     if GRAPH_CONTEXT.tmp_static_cache is not None:
       # take current static cache
       static_cache = GRAPH_CONTEXT.tmp_static_cache
@@ -1813,12 +2014,12 @@ class UpdateContextManager:
     else:
       static_cache = None
     ctx = UpdateContext(
-        tag=self.tag,
-        outer_ref_outer_index=None,
-        outer_index_inner_ref=None,
-        outer_index_outer_ref=None,
-        inner_ref_outer_index=None,
-        static_cache=static_cache,
+      tag=self.tag,
+      outer_ref_outer_index=None,
+      outer_index_inner_ref=None,
+      outer_index_outer_ref=None,
+      inner_ref_outer_index=None,
+      static_cache=static_cache,
     )
     if self.tag not in GRAPH_CONTEXT.update_context_stacks:
       GRAPH_CONTEXT.update_context_stacks[self.tag] = [ctx]
@@ -1891,17 +2092,23 @@ def update_context(tag: tp.Hashable):
 
     >>> from flax import nnx
     ...
-    >>> m1 = nnx.Dict({})
-    >>> with nnx.update_context('example') as ctx:
-    ...   graphdef, state = ctx.split(m1)
+    >>> class Foo(nnx.Module): pass
+    ...
+    >>> m1 = Foo()
+    >>> with nnx.update_context('example'):
+    ...   with nnx.split_context('example') as ctx:
+    ...     graphdef, state = ctx.split(m1)
     ...   @jax.jit
     ...   def f(graphdef, state):
-    ...     m2 = ctx.merge(graphdef, state)
+    ...     with nnx.merge_context('example', inner=True) as ctx:
+    ...       m2 = ctx.merge(graphdef, state)
     ...     m2.a = 1
     ...     m2.ref = m2  # create a reference cycle
-    ...     return ctx.split(m2)
+    ...     with nnx.split_context('example') as ctx:
+    ...       return ctx.split(m2)
     ...   graphdef_out, state_out = f(graphdef, state)
-    ...   m3 = ctx.merge(graphdef_out, state_out)
+    ...   with nnx.merge_context('example', inner=False) as ctx:
+    ...     m3 = ctx.merge(graphdef_out, state_out)
     ...
     >>> assert m1 is m3
     >>> assert m1.a == 1
@@ -1910,36 +2117,38 @@ def update_context(tag: tp.Hashable):
   Note that ``update_context`` takes in a ``tag`` argument which is used
   primarily as a safety mechanism reduce the risk of accidentally using the
   wrong UpdateContext when using :func:`current_update_context` to access the
-  current active context. current_update_context can be used as a way of
-  accessing the current active context without having to pass it as a capture::
+  current active context. ``update_context`` can also be used as a
+  decorator that creates/activates an UpdateContext context for the
+  duration of the function::
 
     >>> from flax import nnx
     ...
-    >>> m1 = nnx.Dict({})
+    >>> class Foo(nnx.Module): pass
+    ...
+    >>> m1 = Foo()
     >>> @jax.jit
     ... def f(graphdef, state):
-    ...   ctx = nnx.current_update_context('example')
-    ...   m2 = ctx.merge(graphdef, state)
+    ...   with nnx.merge_context('example', inner=True) as ctx:
+    ...     m2 = ctx.merge(graphdef, state)
     ...   m2.a = 1     # insert static attribute
     ...   m2.ref = m2  # create a reference cycle
-    ...   return ctx.split(m2)
+    ...   with nnx.split_context('example') as ctx:
+    ...     return ctx.split(m2)
     ...
     >>> @nnx.update_context('example')
     ... def g(m1):
-    ...   ctx = nnx.current_update_context('example')
-    ...   graphdef, state = ctx.split(m1)
+    ...   with nnx.split_context('example') as ctx:
+    ...     graphdef, state = ctx.split(m1)
     ...   graphdef_out, state_out = f(graphdef, state)
-    ...   return ctx.merge(graphdef_out, state_out)
+    ...   with nnx.merge_context('example', inner=False) as ctx:
+    ...     return ctx.merge(graphdef_out, state_out)
     ...
     >>> m3 = g(m1)
     >>> assert m1 is m3
     >>> assert m1.a == 1
     >>> assert m1.ref is m1
 
-  As shown in the code above, ``update_context`` can also be used as a
-  decorator that creates/activates an UpdateContext context for the
-  duration of the function. The context can be accessed using
-  :func:`current_update_context`.
+  The context can be accessed using :func:`current_update_context`.
 
   Args:
     tag: A string tag to identify the context.
@@ -1973,15 +2182,15 @@ def _split_state(
 
 
 @tp.overload
-def split(
+def split(  # type: ignore[invalid-annotation]
   graph_node: A, /
-) -> tuple[GraphDef[A], GraphState | VariableState]: ...
+) -> tuple[GraphDef[A], GraphState]: ...
 @tp.overload
-def split(
+def split(  # type: ignore[invalid-annotation]
   graph_node: A, first: filterlib.Filter, /
-) -> tuple[GraphDef[A], GraphState | VariableState]: ...
+) -> tuple[GraphDef[A], GraphState]: ...
 @tp.overload
-def split(
+def split(  # type: ignore[invalid-annotation]
   graph_node: A,
   first: filterlib.Filter,
   second: filterlib.Filter,
@@ -1989,15 +2198,15 @@ def split(
   *filters: filterlib.Filter,
 ) -> tuple[
   GraphDef[A],
-  GraphState | VariableState,
-  tpe.Unpack[tuple[GraphState | VariableState, ...]],
+  GraphState,
+  tpe.Unpack[tuple[GraphState, ...]],
 ]: ...
-def split(
+def split(  # type: ignore[invalid-annotation]
   node: A, *filters: filterlib.Filter
 ) -> tuple[
   GraphDef[A],
-  GraphState | VariableState,
-  tpe.Unpack[tuple[GraphState | VariableState, ...]],
+  GraphState,
+  tpe.Unpack[tuple[GraphState, ...]],
 ]:
   """Split a graph node into a :class:`GraphDef` and one or more :class:`State`s. State is
   a ``Mapping`` from strings or integers to ``Variables``, Arrays or nested States. GraphDef
@@ -2021,22 +2230,18 @@ def split(
     >>> jax.tree.map(jnp.shape, params)
     State({
       'batch_norm': {
-        'bias': VariableState(
-          type=Param,
+        'bias': Param(
           value=(2,)
         ),
-        'scale': VariableState(
-          type=Param,
+        'scale': Param(
           value=(2,)
         )
       },
       'linear': {
-        'bias': VariableState(
-          type=Param,
+        'bias': Param(
           value=(3,)
         ),
-        'kernel': VariableState(
-          type=Param,
+        'kernel': Param(
           value=(2, 3)
         )
       }
@@ -2044,12 +2249,10 @@ def split(
     >>> jax.tree.map(jnp.shape, batch_stats)
     State({
       'batch_norm': {
-        'mean': VariableState(
-          type=BatchStat,
+        'mean': BatchStat(
           value=(2,)
         ),
-        'var': VariableState(
-          type=BatchStat,
+        'var': BatchStat(
           value=(2,)
         )
       }
@@ -2076,9 +2279,12 @@ def split(
 def _to_nested_state(
   graphdef: GraphDef[A], flat_states: tp.Iterable[tp.Any]
 ) -> tuple[tp.Any, ...]:
-  if type(graphdef) is VariableDef:
+  if not graphdef.nodes or type(graphdef.nodes[0]) in (
+    VariableDef,
+    ArrayRefDef,
+  ):
     states = tuple(
-      flat_state[0][1] if flat_state else EmptyState()
+      flat_state[0][1] if flat_state else State({})
       for flat_state in flat_states
     )
   else:
@@ -2094,6 +2300,8 @@ def _merge_to_flat_state(states: tp.Iterable[tp.Any]):
   for state in states:
     if isinstance(state, dict | State):
       flat_state.extend(traversals.flatten_to_sequence(state))
+    elif isinstance(state, FlatState):
+      flat_state.extend(state)
     else:
       flat_state.append(((), state))
 
@@ -2101,11 +2309,12 @@ def _merge_to_flat_state(states: tp.Iterable[tp.Any]):
   return [value for _, value in flat_state]
 
 
-def merge(
+def merge(  # type: ignore[invalid-annotation]
   graphdef: GraphDef[A],
   state: tp.Any,
   /,
   *states: tp.Any,
+  copy: bool = False,
 ) -> A:
   """The inverse of :func:`flax.nnx.split`.
 
@@ -2147,11 +2356,17 @@ def merge(
     graphdef: A :class:`flax.nnx.GraphDef` object.
     state: A :class:`flax.nnx.State` object.
     *states: Additional :class:`flax.nnx.State` objects.
+    copy: Whether to create new copies of the Variables in the states, defaults to ``False``.
   Returns:
     The merged :class:`flax.nnx.Module`.
   """
-  _state = _merge_to_flat_state((state, *states))
-  node = unflatten(graphdef, _state)
+  if isinstance(state, list):
+    if len(states) != 0:
+      raise ValueError(f'Only one state can be passed as a list.')
+    _state = state
+  else:
+    _state = _merge_to_flat_state((state, *states))
+  node = unflatten(graphdef, _state, copy_variables=copy)
   return node
 
 
@@ -2206,57 +2421,6 @@ def _variables_generator(node) -> tp.Iterable[tuple[PathParts, Variable]]:
 
 
 @tp.overload
-def variables(node, /) -> State[Key, Variable]: ...
-@tp.overload
-def variables(node, first: filterlib.Filter, /) -> State[Key, Variable]: ...
-@tp.overload
-def variables(
-  node,
-  first: filterlib.Filter,
-  second: filterlib.Filter,
-  /,
-  *filters: filterlib.Filter,
-) -> tuple[State[Key, Variable], ...]: ...
-def variables(
-  node,
-  *filters: filterlib.Filter,
-) -> tp.Union[State[Key, Variable], tuple[State[Key, Variable], ...]]:
-  """Similar to :func:`state` but returns the current :class:`Variable` objects instead
-  of new :class:`VariableState` instances.
-
-  Example::
-
-    >>> from flax import nnx
-    ...
-    >>> model = nnx.Linear(2, 3, rngs=nnx.Rngs(0))
-    >>> params = nnx.variables(model, nnx.Param)
-    ...
-    >>> assert params['kernel'] is model.kernel
-    >>> assert params['bias'] is model.bias
-
-  Args:
-    node: A graph node object.
-    *filters: One or more :class:`Variable` objects to filter by.
-  Returns:
-    One or more :class:`State` mappings containing the :class:`Variable` objects.
-  """
-  num_filters = len(filters)
-  if num_filters == 0:
-    filters = (..., ...)
-  else:
-    filters = (*filters, ...)
-
-  variables_iterable = _variables_generator(node)
-  flat_states = variablelib.split_flat_state(
-    variables_iterable, (*filters, ...)
-  )
-  states = tuple(statelib.from_flat_state(flat_state) for flat_state in flat_states)
-  if num_filters < 2:
-    return states[0]
-  return states
-
-
-@tp.overload
 def state(node, /) -> GraphState: ...
 @tp.overload
 def state(node, first: filterlib.Filter, /) -> GraphState: ...
@@ -2306,13 +2470,16 @@ def state(
 
   states: GraphState | tuple[GraphState, ...]
   if len(filters) == 0:
-    states = state
+    states = state  # type: ignore[assignment]
   elif len(filters) == 1:
     states = statelib.filter_state(state, filters[0])
   else:
     states = statelib.filter_state(state, filters[0], filters[1], *filters[2:])
 
   return states
+
+
+variables = state
 
 
 def graphdef(node: tp.Any, /) -> GraphDef[tp.Any]:
@@ -2396,7 +2563,7 @@ def pop(
   id_to_index: dict[int, Index] = {}
   path_parts: PathParts = ()
   predicates = tuple(filterlib.to_predicate(filter) for filter in filters)
-  flat_states: tuple[dict[PathParts, StateLeaf], ...] = tuple(
+  flat_states: tuple[dict[PathParts, LeafType], ...] = tuple(
     {} for _ in predicates
   )
   _graph_pop(
@@ -2434,7 +2601,187 @@ def clone(node: Node) -> Node:
     A deep copy of the :class:`Module` object.
   """
   graphdef, state = split(node)
-  return merge(graphdef, state)
+  return merge(graphdef, state, copy=True)
+
+
+def _mutable_like(path, x):
+  return (isinstance(x, Variable) and x.has_ref) or variablelib.is_array_ref(x)
+
+
+def to_arrays(
+  node: A,
+  /,
+  *,
+  only: filterlib.Filter = _mutable_like,
+  allow_duplicates: bool = False,
+) -> A:
+  """Converts a structure of array refs to regular arrays.
+
+  Example::
+
+    >>> from flax import nnx
+    >>> import jax
+    >>> import jax.numpy as jnp
+    ...
+    >>> node = [nnx.array_ref(jnp.array(1.0)), jnp.array(2.0)]
+    >>> assert nnx.is_array_ref(node[0])
+    ...
+    >>> frozen_node = nnx.to_arrays(node)
+    >>> assert isinstance(frozen_node[0], jax.Array)
+
+  If the structure contains duplicate array refs, a ValueError is raised::
+
+    >>> shared_array = nnx.array_ref(jnp.array(1.0))
+    >>> node = [shared_array, shared_array]
+    >>> try:
+    ...   nnx.to_arrays(node)
+    ... except ValueError as e:
+    ...   print(e)
+    Found duplicate at paths:
+      ---
+      0
+      1
+      ---
+
+  ``only`` is a `Filter <https://flax.readthedocs.io/en/latest/guides/filters_guide.html>`__
+  that can be used to specify which array refs to freeze::
+
+    >>> node = [nnx.array_ref(jnp.array(1.0)), nnx.array_ref(jnp.array(2.0))]
+    >>> frozen_node = nnx.to_arrays(node, only=lambda path, x: path[0] == 0)
+    ...
+    >>> assert isinstance(frozen_node[0], jax.Array)
+    >>> assert isinstance(frozen_node[1], nnx.ArrayRef)
+
+  Args:
+    node: A structure potentially containing array refs.
+    only: A Filter to specify which array refs to freeze.
+  Returns:
+    A structure with the frozen arrays.
+  """
+  if not allow_duplicates and (all_duplicates := find_duplicates(node, only=only)):
+    duplicates_strs = '\n  ---'
+    for node_duplicates in all_duplicates:
+      for path in node_duplicates:
+        path_str = '/'.join(map(str, path))
+        duplicates_strs += f'\n  {path_str}'
+      duplicates_strs += '\n  ---'
+    raise ValueError(f'Found duplicate at paths:{duplicates_strs}')
+
+  graphdef, mutable_state, rest = split(node, only, ...)  # type: ignore[misc]
+  frozen_state = jax.tree.map(lambda x: x[...], mutable_state)
+  node = merge(graphdef, frozen_state, rest)
+  return node
+
+
+def _array_like(path, x):
+  return (isinstance(x, Variable) and not x.has_ref) or isinstance(x, jax.Array)
+
+
+def to_refs(node: A, /, only: filterlib.Filter = _array_like) -> A:
+  """Converts a structure of arrays to array refs.
+
+  Example::
+
+    >>> from flax import nnx
+    >>> import jax
+    >>> import jax.numpy as jnp
+    ...
+    >>> node = [jnp.array(1.0), nnx.array_ref(jnp.array(2.0))]
+    >>> mutable_node = nnx.to_refs(node)
+    >>> assert nnx.is_array_ref(mutable_node[0])
+    >>> assert nnx.is_array_ref(mutable_node[1])
+
+  If the structure contains duplicate arrays a ValueError is raised::
+
+    >>> shared_array = jnp.array(1.0)
+    >>> node = [shared_array, shared_array]
+    >>> try:
+    ...   nnx.to_refs(node)
+    ... except ValueError as e:
+    ...   print(e)
+    Found duplicate at paths:
+      ---
+      0
+      1
+      ---
+
+  ``only`` is a `Filter <https://flax.readthedocs.io/en/latest/guides/filters_guide.html>`__
+  that can be used to specify which arrays to convert to array refs.
+
+    >>> node = [jnp.array(1.0), jnp.array(2.0)]
+    >>> mutable_node = nnx.to_refs(node, only=lambda path, x: path[0] == 0)
+    ...
+    >>> assert isinstance(mutable_node[0], nnx.ArrayRef)
+    >>> assert isinstance(mutable_node[1], jax.Array)
+
+  Args:
+    node: A structure potentially containing arrays.
+    only: A Filter to specify which arrays to convert to array refs.
+  Returns:
+    A structure with the array refs.
+  """
+  if all_duplicates := find_duplicates(node, only=only):
+    duplicates_strs = '\n  ---'
+    for node_duplicates in all_duplicates:
+      for path in node_duplicates:
+        path_str = '/'.join(map(str, path))
+        duplicates_strs += f'\n  {path_str}'
+      duplicates_strs += '\n  ---'
+    raise ValueError(f'Found duplicate at paths:{duplicates_strs}')
+
+  graphdef, frozen_state, rest = split(node, only, ...)  # type: ignore[misc]
+  mutable_state = jax.tree.map(variablelib.array_ref, frozen_state)
+  node = merge(graphdef, mutable_state, rest)
+  return node
+
+
+def pure(tree: A) -> A:
+  """Returns a new tree with all ``Variable`` objects replaced with inner values.
+
+  This can be used to remove Variable metadata when its is not needed for tasks like
+  serialization or exporting.
+
+  Example::
+
+    >>> from flax import nnx
+    >>> import jax
+    >>> import jax.numpy as jnp
+    ...
+    >>> model = nnx.Linear(2, 3, rngs=nnx.Rngs(0))
+    >>> graphdef, state = nnx.split(model)
+    >>> jax.tree.map(jnp.shape, state)
+    State({
+      'bias': Param(
+        value=(3,)
+      ),
+      'kernel': Param(
+        value=(2, 3)
+      )
+    })
+    >>> pure_state = nnx.pure(state)
+    >>> jax.tree.map(jnp.shape, pure_state)
+    State({
+      'bias': (3,),
+      'kernel': (2, 3)
+    })
+
+  Args:
+    tree: A pytree potentially containing ``Variable`` objects.
+  Returns:
+    A new pytree with all ``Variable`` objects replaced with their
+    inner values.
+  """
+
+  def _pure_fn(x):
+    if isinstance(x, Variable):
+      return x.raw_value
+    return x
+
+  return jax.tree.map(
+    _pure_fn,
+    tree,
+    is_leaf=lambda x: isinstance(x, Variable),
+  )
 
 
 def call(
@@ -2458,7 +2805,7 @@ def call(
     ...   def __init__(self, din, dout, rngs):
     ...     self.w = nnx.Param(jax.random.uniform(rngs(), (din, dout)))
     ...     self.b = nnx.Param(jnp.zeros((dout,)))
-    ...     self.count = nnx.Variable(jnp.array(0, dtype=jnp.uint32))
+    ...     self.count = Variable(jnp.array(0, dtype=jnp.uint32))
     ...
     ...   def increment(self):
     ...     self.count += 1
@@ -2535,6 +2882,7 @@ def iter_graph(node: tp.Any, /) -> tp.Iterator[tuple[PathParts, tp.Any]]:
   root. Repeated nodes are visited only once. Leaves include static values.
 
   Example::
+
     >>> from flax import nnx
     >>> import jax.numpy as jnp
     ...
@@ -2550,7 +2898,8 @@ def iter_graph(node: tp.Any, /) -> tp.Iterator[tuple[PathParts, tp.Any]]:
     >>> for path, value in nnx.iter_graph(graph):
     ...   print(path, type(value).__name__)
     ...
-    (0, '_object__state') ObjectState
+    (0, '_pytree__nodes') HashableMapping
+    (0, '_pytree__state') PytreeState
     (0, 'b') Param
     (0, 'din') int
     (0, 'dout') int
@@ -2571,25 +2920,104 @@ def _iter_graph(
       return
     visited.add(id(node))
     node_impl = get_node_impl(node)
-    if node_impl is None:
-      raise RuntimeError(f'Unsupported type: {type(node)}, this is a bug.')
-    node_dict = node_impl.node_dict(node)
-    for key, value in node_dict.items():
-      yield from _iter_graph(value, visited, (*path_parts, key))
+    if node_impl is not None:
+      node_dict = node_impl.node_dict(node)
+      for key, value in node_dict.items():
+        yield from _iter_graph(value, visited, (*path_parts, key))
 
   yield path_parts, node
 
 
-@dataclasses.dataclass(frozen=True)
+def find_duplicates(node: tp.Any, /, *, only: filterlib.Filter = ...) -> list[list[PathParts]]:
+  """Finds duplicate nodes or node leaves in the given node.
+
+  This function traverses the graph node and collects paths to nodes and leaves
+  that have the same identity. It returns a list of lists, where each inner list
+  contains paths to nodes or leaves that are duplicates.
+
+  Example::
+
+    >>> from flax import nnx
+    >>> import jax.numpy as jnp
+    ...
+    >>> class SharedVariables(nnx.Module):
+    ...   def __init__(self):
+    ...     self.a = nnx.Param(jnp.array(1.0))
+    ...     self.b = nnx.Param(jnp.array(2.0))
+    ...     self.c = self.b  # shared Variable
+    ...
+    >>> model = SharedVariables()
+    >>> duplicates = nnx.find_duplicates(model)
+    >>> len(duplicates)
+    1
+    >>> for path in duplicates[0]:
+    ...   print(path)
+    ('b',)
+    ('c',)
+
+  ``find_duplicates`` will also find duplicates nodes such as Modules that are
+  referenced multiple times in the graph::
+
+    >>> class SharedModules(nnx.Module):
+    ...   def __init__(self, rngs: nnx.Rngs):
+    ...     self.a = nnx.Linear(1, 1, rngs=rngs)
+    ...     self.b = nnx.Linear(1, 1, rngs=rngs)
+    ...     self.c = self.a  # shared Module
+    ...
+    >>> model = SharedModules(nnx.Rngs(0))
+    >>> for duplicate_paths in nnx.find_duplicates(model):
+    ...   print(duplicate_paths)
+    [('a',), ('c',)]
+
+  Args:
+    node: A graph node object.
+    only: A Filter to specify which nodes or leaves to consider for duplicates.
+  Returns:
+    A list of lists, where each inner list contains the different paths for a
+    for a duplicate node or leaf.
+  """
+  node_paths: dict[int, list[PathParts]] = {}
+  duplicate_candidate = filterlib.to_predicate(only)
+  _node_paths(node, node_paths, (), duplicate_candidate)
+  _duplicates = [paths for paths in node_paths.values() if len(paths) > 1]
+  return _duplicates
+
+
+def _node_paths(
+  node: tp.Any,
+  node_paths: dict[int, list[PathParts]],
+  path: PathParts,
+  duplicate_candidate: filterlib.Predicate,
+  /,
+):
+  _is_graph_node = is_graph_node(node)
+  _is_pytree_node = is_pytree_node(node)
+  _is_node_leaf = is_node_leaf(node)
+
+  if _is_graph_node or _is_pytree_node or _is_node_leaf:
+    node_id = id(node)
+    if node_id in node_paths:
+      if (_is_graph_node or _is_node_leaf) and duplicate_candidate(path, node):
+        node_paths[node_id].append(path)
+      return
+    if _is_graph_node or _is_node_leaf:
+      node_paths[node_id] = [path]
+    node_impl = get_node_impl(node)
+    if node_impl is None:
+      return
+    node_dict = node_impl.node_dict(node)
+    for key, value in node_dict.items():
+      _node_paths(value, node_paths, (*path, key), duplicate_candidate)
+
+
+@jax.tree_util.register_static
+@dataclasses.dataclass(frozen=True, slots=True)
 class Static(tp.Generic[A]):
   """An empty pytree node that treats its inner value as static.
   ``value`` must define ``__eq__`` and ``__hash__``.
   """
 
   value: A
-
-
-jax.tree_util.register_static(Static)
 
 
 # ---------------------------------------------------------
@@ -2602,7 +3030,11 @@ from jax._src.tree_util import _registry as JAX_PYTREE_REGISTRY
 
 
 def is_pytree_node(x: tp.Any) -> bool:
-  if type(x) in JAX_PYTREE_REGISTRY:
+  if type(x) in GRAPH_REGISTRY:
+    return False
+  elif isinstance(x, Variable):
+    return False
+  elif type(x) in JAX_PYTREE_REGISTRY:
     return True
   elif isinstance(x, tuple):
     return True
@@ -2626,9 +3058,15 @@ def _key_path_to_key(key: tp.Any) -> Key:
   else:
     return str(key)
 
+
+def jax_to_nnx_path(jax_path: tuple, /):
+  return tuple(_key_path_to_key(part) for part in jax_path)
+
+
 class IndexesPytreeDef(tp.NamedTuple):
   key_index: HashableMapping[Key, int]
   treedef: jax.tree_util.PyTreeDef
+
 
 def _flatten_pytree(pytree: tp.Any):
   leaves, treedef = jax.tree_util.tree_flatten_with_path(
@@ -2655,6 +3093,8 @@ PYTREE_NODE_IMPL = PytreeNodeImpl(
   type=GenericPytree,
   flatten=_flatten_pytree,
   unflatten=_unflatten_pytree,  # type: ignore
+  set_key=None,
+  pop_key=None,
 )
 
 # common pytrees
@@ -2670,11 +3110,33 @@ register_pytree_node_type(
   flatten=lambda x: (list(enumerate(x)), None),
   unflatten=lambda nodes, _: tuple(value for _, value in nodes),  # type: ignore
 )
+
+
+def _mutable_mapping_set_key(
+  x: tp.MutableMapping[Key, tp.Any], key: Key, value: tp.Any
+):
+  x[key] = value
+
+
+def _mutable_mapping_pop_key(x: tp.MutableMapping[Key, tp.Any], key: Key):
+  x.pop(key)
+
+
 # dict
 register_pytree_node_type(
   dict,
   flatten=lambda x: (sorted(x.items()), None),
-  unflatten=lambda nodes, _: {key: value for key, value in nodes},  # type: ignore
+  unflatten=lambda nodes, _: dict(nodes),  # type: ignore
+  set_key=_mutable_mapping_set_key,
+  pop_key=_mutable_mapping_pop_key,
+)
+# State
+register_pytree_node_type(
+  State,
+  flatten=lambda x: (sorted(x.raw_mapping.items()), None),
+  unflatten=lambda nodes, _: State(nodes),  # type: ignore
+  set_key=_mutable_mapping_set_key,
+  pop_key=_mutable_mapping_pop_key,
 )
 # None
 register_pytree_node_type(

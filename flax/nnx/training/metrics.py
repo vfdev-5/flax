@@ -19,7 +19,7 @@ import numpy as np
 
 from flax import struct
 from flax.nnx import filterlib, graph
-from flax.nnx.object import Object
+from flax.nnx.pytreelib import Pytree
 from flax.nnx.variablelib import Variable
 import jax, jax.numpy as jnp
 
@@ -32,7 +32,7 @@ class MetricState(Variable):
   pass
 
 
-class Metric(Object):
+class Metric(Pytree):
   """Base class for metrics. Any class that subclasses ``Metric`` should
   implement a ``compute``, ``reset`` and ``update`` method."""
 
@@ -112,7 +112,7 @@ class Average(Metric):
       raise TypeError(f"Expected keyword argument '{self.argname}'")
     values: tp.Union[int, float, jax.Array] = kwargs[self.argname]
     self.total.value += (
-        values if isinstance(values, (int, float)) else values.sum()
+      values if isinstance(values, (int, float)) else values.sum()
     )
     self.count.value += 1 if isinstance(values, (int, float)) else values.size
 
@@ -392,7 +392,7 @@ class MultiMetric(Metric):
     self._metric_names = []
     for metric_name, metric in metrics.items():
       self._metric_names.append(metric_name)
-      vars(self)[metric_name] = metric
+      setattr(self, metric_name, metric)
 
   def reset(self) -> None:
     """Reset all underlying ``Metric``'s."""

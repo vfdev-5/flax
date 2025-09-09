@@ -20,6 +20,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import orbax.checkpoint as ocp
+import optax
 
 from flax import nnx
 
@@ -203,9 +204,9 @@ class TestIntegration(absltest.TestCase):
     @jax.jit
     def train_step(params, counts, x, y):
       def loss_fn(params):
-        y_pred, (_, updates) = graphdef.apply(params, counts)(x)
-        loss = jax.numpy.mean((y_pred - y) ** 2)
-        return loss, nnx.filter_state(updates, Count)
+        model = nnx.merge(graphdef, params, counts, copy=True)
+        loss = jax.numpy.mean((model(x) - y) ** 2)
+        return loss, nnx.state(model, Count)
 
       # compute gradient
       grads, counts = jax.grad(loss_fn, has_aux=True)(params)
@@ -264,7 +265,7 @@ class TestIntegration(absltest.TestCase):
   def test_replace_by_pure_dict(self):
     class MLPs(nnx.Module):
       def __init__(self, dim, rngs: nnx.Rngs):
-        self.layers = []
+        self.layers = nnx.List()
         for _ in range(4):
           self.layers.append(nnx.Linear(dim, dim, rngs=rngs, use_bias=False))
 
@@ -291,13 +292,44 @@ class TestIntegration(absltest.TestCase):
 
       # Restore as a pure dictionary.
       restored_pure_dict = checkpointer.restore(ckpt_dir / 'pure_dict')
-      nnx.display(restored_pure_dict)
+      restored_pure_dict = nnx.statelib.restore_int_paths(restored_pure_dict)
 
-      abstract_model = nnx.eval_shape(lambda: MLPs(4, rngs=nnx.Rngs(0)))
-      graphdef, abstract_state = nnx.split(abstract_model)
-      nnx.replace_by_pure_dict(abstract_state, restored_pure_dict)
-      model = nnx.merge(graphdef, abstract_state)
+      model = nnx.eval_shape(lambda: MLPs(4, rngs=nnx.Rngs(0)))
+      nnx.update(model, restored_pure_dict)
       assert model(x).shape == (3, 4)  # The model still works!
+
+  def test_example_mutable_arrays(self):
+    class Model(nnx.Module):
+      def __init__(self, din, dmid, dout, rngs: nnx.Rngs):
+        self.linear = nnx.Linear(din, dmid, rngs=rngs)
+        self.bn = nnx.BatchNorm(dmid, rngs=rngs)
+        self.dropout = nnx.Dropout(0.2, rngs=rngs)
+        self.linear_out = nnx.Linear(dmid, dout, rngs=rngs)
+
+      def __call__(self, x):
+        x = nnx.relu(self.dropout(self.bn(self.linear(x))))
+        return self.linear_out(x)
+
+    with nnx.use_refs(True):
+      model = Model(2, 64, 3, rngs=nnx.Rngs(0))  # eager initialization
+      optimizer = nnx.Optimizer(model, optax.adam(1e-3), wrt=nnx.Param)
+
+    @jax.jit  # automatic state management for JAX transforms
+    def train_step(x, y):
+      graphdef, params, nondiff = nnx.split(model, nnx.Param, ...)
+      def loss_fn(params):
+        model =  nnx.merge(graphdef, params, nondiff)
+        return ((model(x) - y) ** 2).mean() # call methods directly
+
+      loss, grads = jax.value_and_grad(loss_fn)(nnx.to_arrays(params))
+      optimizer.update(model, grads)  # in-place updates
+
+      return loss
+
+    x = jax.random.normal(jax.random.key(0), (8, 2))
+    y = jax.random.normal(jax.random.key(1), (8, 3))
+
+    train_step(x, y)
 
 
 if __name__ == '__main__':

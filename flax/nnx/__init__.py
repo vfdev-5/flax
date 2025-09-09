@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from flax.core.spmd import logical_axis_rules as logical_axis_rules
 from flax.linen.pooling import avg_pool as avg_pool
 from flax.linen.pooling import max_pool as max_pool
 from flax.linen.pooling import min_pool as min_pool
@@ -30,8 +31,18 @@ from .filterlib import Nothing as Nothing
 from .graph import GraphDef as GraphDef
 from .graph import GraphState as GraphState
 from .graph import PureState as PureState
-from .object import Object as Object
+from . import pytreelib as object
+from .pytreelib import Pytree as Pytree
+from .pytreelib import Object as Object
+from .pytreelib import Data as Data
+from .pytreelib import Static as Static
+from .pytreelib import data as data
+from .pytreelib import static as static
+from .pytreelib import register_data_type as register_data_type
+from .pytreelib import is_data as is_data
+from .pytreelib import check_pytree as check_pytree
 from .helpers import Dict as Dict
+from .helpers import List as List
 from .helpers import Sequential as Sequential
 from .helpers import TrainState as TrainState
 from .module import M as M
@@ -47,13 +58,19 @@ from .graph import pop as pop
 from .graph import state as state
 from .graph import graphdef as graphdef
 from .graph import iter_graph as iter_graph
+from .graph import find_duplicates as find_duplicates
 from .graph import call as call
 from .graph import SplitContext as SplitContext
 from .graph import split_context as split_context
 from .graph import MergeContext as MergeContext
 from .graph import merge_context as merge_context
 from .graph import variables as variables
+from .graph import to_arrays as to_arrays
+from .graph import to_refs as to_refs
+from .graph import pure as pure
 from .graph import cached_partial as cached_partial
+from .graph import flatten as flatten
+from .graph import unflatten as unflatten
 from .nn import initializers as initializers
 from .nn.activations import celu as celu
 from .nn.activations import elu as elu
@@ -72,6 +89,7 @@ from .nn.activations import relu as relu
 from .nn.activations import relu6 as relu6
 from .nn.activations import selu as selu
 from .nn.activations import sigmoid as sigmoid
+from .nn.activations import identity as identity
 from .nn.activations import silu as silu
 from .nn.activations import soft_sign as soft_sign
 from .nn.activations import softmax as softmax
@@ -112,8 +130,7 @@ from .rnglib import RngStream as RngStream
 from .rnglib import RngState as RngState
 from .rnglib import RngKey as RngKey
 from .rnglib import RngCount as RngCount
-from .rnglib import ForkStates as ForkStates
-from .rnglib import fork as fork
+from .rnglib import fork_rngs as fork_rngs
 from .rnglib import reseed as reseed
 from .rnglib import split_rngs as split_rngs
 from .rnglib import restore_rngs as restore_rngs
@@ -121,7 +138,7 @@ from .spmd import PARTITION_NAME as PARTITION_NAME
 from .spmd import get_partition_spec as get_partition_spec
 from .spmd import get_named_sharding as get_named_sharding
 from .spmd import with_partitioning as with_partitioning
-from .spmd import with_sharding_constraint as with_sharding_constraint
+from .spmd import get_abstract_model as get_abstract_model
 from .statelib import State as State
 from .statelib import to_flat_state as to_flat_state
 from .statelib import from_flat_state as from_flat_state
@@ -137,12 +154,12 @@ from .variablelib import Param as Param
 from .training import optimizer as optimizer
 from .training.metrics import Metric as Metric
 from .training.metrics import MultiMetric as MultiMetric
+from .training.optimizer import OptState as OptState
+from .training.optimizer import OptArray as OptArray
+from .training.optimizer import OptVariable as OptVariable
 from .training.optimizer import Optimizer as Optimizer
-from .transforms.deprecated import Jit as Jit
-from .transforms.deprecated import Remat as Remat
-from .transforms.deprecated import Scan as Scan
-from .transforms.deprecated import Vmap as Vmap
-from .transforms.deprecated import Pmap as Pmap
+from .training.optimizer import ModelAndOptimizer as ModelAndOptimizer
+from .training.optimizer import OptState as OptState
 from .transforms.autodiff import DiffState as DiffState
 from .transforms.autodiff import grad as grad
 from .transforms.autodiff import value_and_grad as value_and_grad
@@ -168,15 +185,36 @@ from .variablelib import Cache as Cache
 from .variablelib import Intermediate as Intermediate
 from .variablelib import Perturbation as Perturbation
 from .variablelib import Variable as Variable
-from .variablelib import VariableState as VariableState
 from .variablelib import VariableMetadata as VariableMetadata
 from .variablelib import with_metadata as with_metadata
 from .variablelib import variable_type_from_name as variable_type_from_name
 from .variablelib import variable_name_from_type as variable_name_from_type
 from .variablelib import register_variable_name as register_variable_name
+from .variablelib import array_ref as array_ref
+from .variablelib import ArrayRef as ArrayRef
+from .variablelib import is_array_ref as is_array_ref
+from .variablelib import use_refs as use_refs
+from .variablelib import using_refs as using_refs
 from .visualization import display as display
 from .extract import to_tree as to_tree
 from .extract import from_tree as from_tree
 from .extract import NodeStates as NodeStates
 from .summary import tabulate as tabulate
 from . import traversals as traversals
+
+# alias VariableState
+VariableState = Variable
+
+import typing as _tp
+
+if not _tp.TYPE_CHECKING:
+  def __getattr__(name):
+    if name == "VariableState":
+      import warnings
+      warnings.warn(
+          "'VariableState' was removed, this is just an alias to 'Variable'. "
+          "Plase use 'Variable' directly instead.",
+          DeprecationWarning,
+          stacklevel=2,
+      )
+    raise AttributeError(f"Module {__name__} has no attribute '{name}'")

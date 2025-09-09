@@ -26,6 +26,7 @@ from flax import nnx
 from flax.nnx import rnglib, variablelib
 from flax.nnx.module import Module, first_from
 from flax.nnx.nn import dtypes, initializers
+from flax import nnx
 from flax.typing import (
   Dtype,
   Shape,
@@ -36,6 +37,7 @@ from flax.typing import (
   PaddingLike,
   LaxPadding,
   PromoteDtypeFn,
+  EinsumT,
 )
 
 Array = jax.Array
@@ -137,6 +139,9 @@ class LinearGeneral(Module):
       dtype. The function should accept a tuple of ``(inputs, kernel, bias)``
       and a ``dtype`` keyword argument, and return a tuple of arrays with the
       promoted dtype.
+    preferred_element_type: Optional parameter controls the data type output by
+      the dot product. This argument is passed to ``dot_general`` function.
+      See ``jax.lax.dot`` for details.
     rngs: rng key.
   """
 
@@ -154,9 +159,9 @@ class LinearGeneral(Module):
     bias_init: Initializer = default_bias_init,
     precision: PrecisionLike = None,
     promote_dtype: PromoteDtypeFn = dtypes.promote_dtype,
-    # Deprecated. Will be removed.
     dot_general: DotGeneralT | None = None,
     dot_general_cls: tp.Any = None,
+    preferred_element_type: Dtype | None = None,
     rngs: rnglib.Rngs,
   ):
     self.in_features = _canonicalize_tuple(in_features)
@@ -172,6 +177,7 @@ class LinearGeneral(Module):
     self.dot_general = dot_general
     self.dot_general_cls = dot_general_cls
     self.promote_dtype = promote_dtype
+    self.preferred_element_type = preferred_element_type
 
     if len(self.in_features) != len(self.axis):
       raise ValueError(
@@ -234,7 +240,7 @@ class LinearGeneral(Module):
         bias_init_wrap(rngs.params(), bias_shape, self.param_dtype)
       )
     else:
-      self.bias = None
+      self.bias = nnx.data(None)
 
   def __call__(self, inputs: Array) -> Array:
     """Applies a linear transformation to the inputs along multiple dimensions.
@@ -274,11 +280,19 @@ class LinearGeneral(Module):
       dot_general = self.dot_general
     else:
       dot_general = lax.dot_general
+    # We use dot_general_kwargs for BC compatibility with
+    # user custom dot_general/dot_general_cls which may not have
+    # preferred_element_type argument to avoid breaking
+    # existing code
+    dot_general_kwargs = {}
+    if self.preferred_element_type is not None:
+      dot_general_kwargs["preferred_element_type"] = self.preferred_element_type
     out = dot_general(
       inputs,
       kernel,
       ((axis, contract_ind), (batch_axis, batch_ind)),
       precision=self.precision,
+      **dot_general_kwargs,
     )
     # dot_general output has shape [batch_dims/group_dims] + [feature_dims]
     if bias is not None:
@@ -299,12 +313,10 @@ class Linear(Module):
     >>> layer = nnx.Linear(in_features=3, out_features=4, rngs=nnx.Rngs(0))
     >>> jax.tree.map(jnp.shape, nnx.state(layer))
     State({
-      'bias': VariableState(
-        type=Param,
+      'bias': Param(
         value=(4,)
       ),
-      'kernel': VariableState(
-        type=Param,
+      'kernel': Param(
         value=(3, 4)
       )
     })
@@ -324,6 +336,9 @@ class Linear(Module):
       dtype. The function should accept a tuple of ``(inputs, kernel, bias)``
       and a ``dtype`` keyword argument, and return a tuple of arrays with the
       promoted dtype.
+    preferred_element_type: Optional parameter controls the data type output by
+      the dot product. This argument is passed to ``dot_general`` function.
+      See ``jax.lax.dot`` for details.
     rngs: rng key.
   """
 
@@ -340,6 +355,7 @@ class Linear(Module):
     bias_init: Initializer = default_bias_init,
     dot_general: DotGeneralT = lax.dot_general,
     promote_dtype: PromoteDtypeFn = dtypes.promote_dtype,
+    preferred_element_type: Dtype | None = None,
     rngs: rnglib.Rngs,
   ):
     kernel_key = rngs.params()
@@ -351,7 +367,7 @@ class Linear(Module):
       bias_key = rngs.params()
       self.bias = nnx.Param(bias_init(bias_key, (out_features,), param_dtype))
     else:
-      self.bias = None
+      self.bias = nnx.data(None)
 
     self.in_features = in_features
     self.out_features = out_features
@@ -363,6 +379,7 @@ class Linear(Module):
     self.bias_init = bias_init
     self.dot_general = dot_general
     self.promote_dtype = promote_dtype
+    self.preferred_element_type = preferred_element_type
 
   def __call__(self, inputs: Array) -> Array:
     """Applies a linear transformation to the inputs along the last dimension.
@@ -379,11 +396,19 @@ class Linear(Module):
     inputs, kernel, bias = self.promote_dtype(
       (inputs, kernel, bias), dtype=self.dtype
     )
+    # We use dot_general_kwargs for BC compatibility with
+    # user custom self.dot_general method which may not have
+    # preferred_element_type argument to avoid breaking
+    # existing code
+    dot_general_kwargs = {}
+    if self.preferred_element_type is not None:
+      dot_general_kwargs["preferred_element_type"] = self.preferred_element_type
     y = self.dot_general(
       inputs,
       kernel,
       (((inputs.ndim - 1,), (0,)), ((), ())),
       precision=self.precision,
+      **dot_general_kwargs,
     )
     assert self.use_bias == (bias is not None)
     if bias is not None:
@@ -426,6 +451,11 @@ class Einsum(Module):
       dtype. The function should accept a tuple of ``(inputs, kernel, bias)``
       and a ``dtype`` keyword argument, and return a tuple of arrays with the
       promoted dtype.
+    einsum_op: An injectable alternative of `jnp.einsum` to do the computation.
+      Should support same signature as `jnp.einsum`.
+    preferred_element_type: Optional parameter controls the data type output by
+      the dot product. This argument is passed to ``dot_general`` function.
+      See ``jax.lax.dot`` for details.
     rngs: rng key.
   """
 
@@ -441,6 +471,8 @@ class Einsum(Module):
     kernel_init: Initializer = default_kernel_init,
     bias_init: Initializer = default_bias_init,
     promote_dtype: PromoteDtypeFn = dtypes.promote_dtype,
+    einsum_op: EinsumT = jnp.einsum,
+    preferred_element_type: Dtype | None = None,
     rngs: rnglib.Rngs,
   ):
     einsum_str = einsum_str.replace(' ', '')
@@ -454,7 +486,7 @@ class Einsum(Module):
       bias_key = rngs.params()
       self.bias = nnx.Param(bias_init(bias_key, bias_shape, param_dtype))
     else:
-      self.bias = None
+      self.bias = nnx.data(None)
 
     self.einsum_str = einsum_str
     self.kernel_shape = kernel_shape
@@ -465,6 +497,8 @@ class Einsum(Module):
     self.kernel_init = kernel_init
     self.bias_init = bias_init
     self.promote_dtype = promote_dtype
+    self.einsum_op = einsum_op
+    self.preferred_element_type = preferred_element_type
 
   def __call__(
     self, inputs: Array, einsum_str: tp.Optional[str] = None
@@ -499,8 +533,17 @@ class Einsum(Module):
       ),
       dtype=self.dtype,
     )
+    # We use einsum_op_kwargs for BC compatibility with
+    # user custom self.einsum_op method which may not have
+    # preferred_element_type argument to avoid breaking
+    # existing code
+    einsum_op_kwargs = {}
+    if self.preferred_element_type is not None:
+      einsum_op_kwargs["preferred_element_type"] = self.preferred_element_type
 
-    y = jnp.einsum(einsum_str, inputs, kernel, precision=self.precision)
+    y = self.einsum_op(
+      einsum_str, inputs, kernel, precision=self.precision, **einsum_op_kwargs
+    )
 
     if bias is not None:
       broadcasted_bias_shape = self._infer_broadcasted_bias_shape(
@@ -633,6 +676,9 @@ class Conv(Module):
       dtype. The function should accept a tuple of ``(inputs, kernel, bias)``
       and a ``dtype`` keyword argument, and return a tuple of arrays with the
       promoted dtype.
+    preferred_element_type: Optional parameter controls the data type output by
+      the convolution. This argument is passed to ``conv_general_dilated``
+      function. See ``jax.lax.conv_general_dilated`` for details.
     rngs: rng key.
   """
 
@@ -656,6 +702,7 @@ class Conv(Module):
     bias_init: Initializer = default_bias_init,
     conv_general_dilated: ConvGeneralDilatedT = lax.conv_general_dilated,
     promote_dtype: PromoteDtypeFn = dtypes.promote_dtype,
+    preferred_element_type: Dtype | None = None,
     rngs: rnglib.Rngs,
   ):
     if isinstance(kernel_size, int):
@@ -677,7 +724,7 @@ class Conv(Module):
       bias_key = rngs.params()
       self.bias = nnx.Param(bias_init(bias_key, bias_shape, param_dtype))
     else:
-      self.bias = None
+      self.bias = nnx.data(None)
 
     self.in_features = in_features
     self.out_features = out_features
@@ -696,6 +743,7 @@ class Conv(Module):
     self.bias_init = bias_init
     self.conv_general_dilated = conv_general_dilated
     self.promote_dtype = promote_dtype
+    self.preferred_element_type = preferred_element_type
 
   def __call__(self, inputs: Array) -> Array:
     """Applies a (potentially unshared) convolution to the inputs.
@@ -734,8 +782,7 @@ class Conv(Module):
     num_batch_dimensions = inputs.ndim - (len(kernel_size) + 1)
     if num_batch_dimensions != 1:
       input_batch_shape = inputs.shape[:num_batch_dimensions]
-      total_batch_size = int(np.prod(input_batch_shape))
-      flat_input_shape = (total_batch_size,) + inputs.shape[
+      flat_input_shape = (-1,) + inputs.shape[
         num_batch_dimensions:
       ]
       inputs = jnp.reshape(inputs, flat_input_shape)
@@ -751,7 +798,7 @@ class Conv(Module):
       kernel_size_dilated = [
         (k - 1) * d + 1 for k, d in zip(kernel_size, kernel_dilation)
       ]
-      zero_pad: tp.List[tuple[int, int]] = [(0, 0)]
+      zero_pad: list[tuple[int, int]] = [(0, 0)]
       pads = (
         zero_pad
         + [((k - 1) // 2, k // 2) for k in kernel_size_dilated]
@@ -792,6 +839,14 @@ class Conv(Module):
       (inputs, kernel, bias), dtype=self.dtype
     )
 
+    # We use conv_kwargs for BC compatibility with
+    # user custom self.conv_general_dilated method which may not have
+    # preferred_element_type argument to avoid breaking
+    # existing code
+    conv_kwargs = {}
+    if self.preferred_element_type is not None:
+      conv_kwargs["preferred_element_type"] = self.preferred_element_type
+
     y = self.conv_general_dilated(
       inputs,
       kernel,
@@ -802,6 +857,7 @@ class Conv(Module):
       dimension_numbers=dimension_numbers,
       feature_group_count=self.feature_group_count,
       precision=self.precision,
+      **conv_kwargs,
     )
 
     if self.use_bias:
@@ -889,6 +945,10 @@ class ConvTranspose(Module):
       dtype. The function should accept a tuple of ``(inputs, kernel, bias)``
       and a ``dtype`` keyword argument, and return a tuple of arrays with the
       promoted dtype.
+    preferred_element_type: Optional parameter controls the data type output by
+      the transposed convolution. This argument is passed to
+      ``jax.lax.conv_transpose`` function. See ``jax.lax.conv_transpose``
+      for details.
     rngs: rng key.
   """
 
@@ -910,6 +970,7 @@ class ConvTranspose(Module):
     bias_init: Initializer = default_bias_init,
     transpose_kernel: bool = False,
     promote_dtype: PromoteDtypeFn = dtypes.promote_dtype,
+    preferred_element_type: Dtype | None = None,
     rngs: rnglib.Rngs,
   ):
     if isinstance(kernel_size, int):
@@ -932,6 +993,7 @@ class ConvTranspose(Module):
     self.bias_init = bias_init
     self.transpose_kernel = transpose_kernel
     self.promote_dtype = promote_dtype
+    self.preferred_element_type = preferred_element_type
 
     if self.transpose_kernel:
       kernel_shape = kernel_size + (self.out_features, in_features)
@@ -949,7 +1011,7 @@ class ConvTranspose(Module):
         self.bias_init(rngs.params(), (self.out_features,), self.param_dtype)
       )
     else:
-      self.bias = None
+      self.bias = nnx.data(None)
 
   def __call__(self, inputs: Array) -> Array:
     """Applies a transposed convolution to the inputs.
@@ -988,8 +1050,7 @@ class ConvTranspose(Module):
     num_batch_dimensions = inputs.ndim - (len(kernel_size) + 1)
     if num_batch_dimensions != 1:
       input_batch_shape = inputs.shape[:num_batch_dimensions]
-      total_batch_size = int(np.prod(input_batch_shape))
-      flat_input_shape = (total_batch_size,) + inputs.shape[
+      flat_input_shape = (-1,) + inputs.shape[
         num_batch_dimensions:
       ]
       inputs = jnp.reshape(inputs, flat_input_shape)
@@ -1028,6 +1089,7 @@ class ConvTranspose(Module):
       rhs_dilation=kernel_dilation,
       transpose_kernel=self.transpose_kernel,
       precision=self.precision,
+      preferred_element_type=self.preferred_element_type,
     )
 
     if self.padding == 'CIRCULAR':
@@ -1100,8 +1162,7 @@ class Embed(Module):
     >>> layer = nnx.Embed(num_embeddings=5, features=3, rngs=nnx.Rngs(0))
     >>> nnx.state(layer)
     State({
-      'embedding': VariableState( # 15 (60 B)
-        type=Param,
+      'embedding': Param( # 15 (60 B)
         value=Array([[ 0.57966787, -0.523274  , -0.43195742],
                [-0.676289  , -0.50300646,  0.33996582],
                [ 0.41796115, -0.59212935,  0.95934135],

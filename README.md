@@ -4,7 +4,8 @@
 
 # Flax: A neural network library and ecosystem for JAX designed for flexibility
 
-![Build](https://github.com/google/flax/workflows/Build/badge.svg?branch=main) [![coverage](https://badgen.net/codecov/c/gh/google/flax)](https://codecov.io/gh/google/flax)
+[![Flax - Test](https://github.com/google/flax/actions/workflows/flax_test.yml/badge.svg)](https://github.com/google/flax/actions/workflows/flax_test.yml)
+[![PyPI version](https://img.shields.io/pypi/v/flax)](https://pypi.org/project/flax/)
 
 [**Overview**](#overview)
 | [**Quick install**](#quick-install)
@@ -157,7 +158,7 @@ To cite this repository:
   author = {Jonathan Heek and Anselm Levskaya and Avital Oliver and Marvin Ritter and Bertrand Rondepierre and Andreas Steiner and Marc van {Z}ee},
   title = {{F}lax: A neural network library and ecosystem for {JAX}},
   url = {http://github.com/google/flax},
-  version = {0.10.4},
+  version = {0.11.2},
   year = {2024},
 }
 ```
