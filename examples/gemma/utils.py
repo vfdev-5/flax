@@ -16,25 +16,12 @@
 # (https://github.com/google/maxtext/blob/main/MaxText/max_utils.py).
 """Provides utilities for training the Flax gemma example."""
 
-from collections.abc import Callable
 import logging
 from typing import Any
 
-from flax import nnx
-import transformer
-from flax.training import train_state
 import jax
 from jax.experimental import mesh_utils
-import jax.numpy as jnp
 import numpy as np
-
-
-Dtype = Any
-Shape = tuple[int, ...]
-
-
-class TrainState(train_state.TrainState):
-  graphdef: nnx.GraphDef[transformer.Transformer]
 
 
 # Mesh utils.
@@ -71,7 +58,7 @@ def create_device_mesh(config: Any):
   ici_parallelism = [
       config.ici_data_parallelism,
       config.ici_fsdp_parallelism,
-      config.ici_tensor_parallelism,
+      min(config.ici_tensor_parallelism, max(num_devices_per_slice // 2, 1)),
   ]
 
   # Find possible unspecified parallelisms
@@ -122,59 +109,3 @@ def fill_unspecified_mesh_axes(
   )
 
   return parallelism_vals
-
-
-# State initialization utils.
-# -----------------------------------------------------------------------------
-
-
-def _to_array(x):
-  if not isinstance(x, jax.Array):
-    x = jnp.asarray(x)
-  return x
-
-
-def setup_initial_state(
-    constructor: Callable[
-        [transformer.TransformerConfig, jax.Array], transformer.Transformer
-    ],
-    tx,
-    config: transformer.TransformerConfig,
-    rng: jax.Array,
-    mesh: jax.sharding.Mesh,
-) -> tuple[TrainState, TrainState]:
-  """We initialize train state, optionally loading from checkpoint.
-
-  Args:
-    constructor: the model constructor
-    tx: the optax.GradientTransformation
-    config: config object
-    rng: jax.prng key
-    mesh: jax.devices() mesh
-
-  Returns:
-    state: the initialized train state
-    state_mesh_annotations: the mesh annotations for the train state
-  """
-
-  @jax.jit
-  def sharded_init():
-    model = constructor(config, rng)
-    graphdef, params = nnx.split(model, nnx.Param)
-    state = TrainState.create(
-        apply_fn=graphdef.apply,
-        params=params,
-        tx=tx,
-        graphdef=graphdef,
-    )
-    state = jax.tree.map(_to_array, state)
-    state_spec = nnx.get_partition_spec(state)
-    state = jax.lax.with_sharding_constraint(state, state_spec)
-    return state
-
-  # Initialization
-  with jax.set_mesh(mesh):
-    state = sharded_init()
-
-  state_sharding = nnx.get_named_sharding(state, mesh)
-  return state, state_sharding
