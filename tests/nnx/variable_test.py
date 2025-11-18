@@ -18,12 +18,12 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from absl.testing import absltest
+from absl.testing import absltest, parameterized
 from flax import nnx
 
 A = tp.TypeVar('A')
 
-class TestVariable(absltest.TestCase):
+class TestVariable(parameterized.TestCase):
   def test_pytree(self):
     r1 = nnx.Param(1)
     self.assertEqual(r1.get_value(), 1)
@@ -94,6 +94,18 @@ class TestVariable(absltest.TestCase):
     v1[...] += v2
 
     self.assertEqual(v1[...], 5)
+
+  @parameterized.product(
+    v1=[jnp.array([1, 2]), jnp.array(2), 3],
+    v2=[jnp.array([1, 2]), jnp.array(2), 3],
+  )
+  def test_eq_op(self, v1, v2):
+    p1 = nnx.Param(v1)
+    p2 = nnx.Param(v2)
+    if isinstance(v1, jax.Array) or isinstance(v2, jax.Array):
+      self.assertEqual((p1 == p2).all(), (v1 == v2).all())
+    else:
+      self.assertEqual(p1 == p2, v1 == v2)
 
   def test_mutable_array_context(self):
     initial_mode = nnx.using_hijax()
